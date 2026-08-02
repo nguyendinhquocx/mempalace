@@ -60,6 +60,24 @@ def _first_or_empty(results, key: str) -> list:
     return outer[0] or []
 
 
+def _aligned_query_ids(results, document_count: int) -> list:
+    """Return query IDs padded to match the document result column.
+
+    Production backends return an ID for every document. Some legacy test
+    mocks omit IDs, so pad with ``None`` instead of letting ``zip`` discard
+    otherwise valid mocked results.
+    """
+    ids = list(_first_or_empty(results, "ids"))
+    if len(ids) < document_count:
+        ids.extend([None] * (document_count - len(ids)))
+    return ids[:document_count]
+
+
+def _result_drawer_id(meta, stored_drawer_id):
+    """Return the ID that round-trips through ``mempalace_get_drawer``."""
+    return (meta or {}).get("parent_drawer_id") or stored_drawer_id
+
+
 def _tokenize(text: str) -> list:
     """Lowercase + strip to alphanumeric tokens of length ≥ 2.
 
@@ -618,10 +636,10 @@ def _bm25_only_via_sqlite(
     """
     db_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
-        return {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
+        return _search_error_result(
+            "No palace found",
+            hint="Run: mempalace init <dir> && mempalace mine <dir>",
+        )
     if collection_name is None:
         from .config import get_configured_collection_name
 
@@ -655,7 +673,7 @@ def _bm25_only_via_sqlite(
     try:
         conn = sqlite3.connect(sqlite_read_uri(db_path), uri=True)
     except sqlite3.Error as e:
-        return {"error": f"sqlite open failed: {e}"}
+        return _search_error_result(f"sqlite open failed: {e}")
 
     try:
         # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
@@ -752,9 +770,10 @@ def _bm25_only_via_sqlite(
         placeholders = ",".join(["?"] * len(candidate_ids))
         meta_rows = conn.execute(
             f"""
-            SELECT id, key, string_value, int_value
-            FROM embedding_metadata
-            WHERE id IN ({placeholders})
+            SELECT m.id, e.embedding_id, m.key, m.string_value, m.int_value
+            FROM embedding_metadata AS m
+            JOIN embeddings AS e ON e.id = m.id
+            WHERE m.id IN ({placeholders})
             """,
             candidate_ids,
         ).fetchall()
@@ -763,8 +782,16 @@ def _bm25_only_via_sqlite(
 
     # Group metadata rows into per-drawer dicts.
     drawers: dict[int, dict] = {}
-    for emb_id, key, sval, ival in meta_rows:
-        d = drawers.setdefault(emb_id, {"_id": emb_id, "metadata": {}, "text": ""})
+    for emb_id, stored_drawer_id, key, sval, ival in meta_rows:
+        d = drawers.setdefault(
+            emb_id,
+            {
+                "_id": emb_id,
+                "_stored_drawer_id": stored_drawer_id,
+                "metadata": {},
+                "text": "",
+            },
+        )
         if key == "chroma:document":
             d["text"] = sval or ""
         else:
@@ -784,6 +811,7 @@ def _bm25_only_via_sqlite(
         full_source = meta.get("source_file", "") or ""
         candidates.append(
             {
+                "drawer_id": _result_drawer_id(meta, d["_stored_drawer_id"]),
                 "text": d["text"],
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
@@ -887,6 +915,7 @@ def _merge_bm25_union_candidates(
         full_source = meta.get("source_file", "") or ""
         bm25_extra.append(
             {
+                "drawer_id": _result_drawer_id(meta, hit.id),
                 "text": hit.document or "",
                 "wing": meta.get("wing", "unknown"),
                 "room": meta.get("room", "unknown"),
@@ -1004,11 +1033,13 @@ def _finalize_candidate_hits(
             source_file=source_file,
         )
     except UnsupportedCapabilityError:
-        return [], {
-            "error": "candidate_strategy='union' requires a backend with lexical_search support",
-            "unsupported_capability": "supports_lexical_search",
-            "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
-        }
+        return [], _search_error_result(
+            "candidate_strategy='union' requires a backend with lexical_search support",
+            unsupported_capability="supports_lexical_search",
+            hint=(
+                "Use candidate_strategy='vector' or select a backend that supports lexical search."
+            ),
+        )
 
     hits = _hybrid_rank(hits, query, metric=_metric_for_collection(drawers_col))[:n_results]
     for h in hits:
@@ -1019,20 +1050,32 @@ def _finalize_candidate_hits(
     return hits, None
 
 
+def _search_error_result(error: str, **extra) -> dict:
+    """Error envelope for programmatic search callers.
+
+    Always includes ``results: []`` so callers can safely index
+    ``result["results"]`` without a KeyError when the palace failed to
+    open or the query raised mid-flight (Windows CI flake surface).
+    """
+    out = {"error": error, "results": []}
+    out.update(extra)
+    return out
+
+
 def _backend_mismatch_result(error: BackendMismatchError) -> dict:
-    return {
-        "error": "Backend mismatch",
-        "details": str(error),
-        "hint": "Select the matching backend or use a fresh palace directory.",
-    }
+    return _search_error_result(
+        "Backend mismatch",
+        details=str(error),
+        hint="Select the matching backend or use a fresh palace directory.",
+    )
 
 
 def _unknown_backend_result(error: KeyError) -> dict:
-    return {
-        "error": "Unknown backend",
-        "details": str(error),
-        "hint": "Check MEMPALACE_BACKEND or the configured backend name.",
-    }
+    return _search_error_result(
+        "Unknown backend",
+        details=str(error),
+        hint="Check MEMPALACE_BACKEND or the configured backend name.",
+    )
 
 
 def _vector_disabled_search(
@@ -1052,12 +1095,12 @@ def _vector_disabled_search(
     except KeyError as e:
         return _unknown_backend_result(e)
     if backend_name != "chroma":
-        return {
-            "error": "vector_disabled fallback is Chroma-only",
-            "unsupported_capability": "chroma_hnsw_fallback",
-            "backend": backend_name,
-            "hint": "Disable vector_disabled for non-Chroma backends.",
-        }
+        return _search_error_result(
+            "vector_disabled fallback is Chroma-only",
+            unsupported_capability="chroma_hnsw_fallback",
+            backend=backend_name,
+            hint="Disable vector_disabled for non-Chroma backends.",
+        )
     return _bm25_only_via_sqlite(
         query,
         palace_path,
@@ -1078,23 +1121,23 @@ def _open_search_collection(palace_path: str, collection_name: str):
         return None, _unknown_backend_result(e)
     except (CollectionNotInitializedError, PalaceNotFoundError) as e:
         logger.error("No palace found at %s: %s", palace_path, e)
-        return None, {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
+        return None, _search_error_result(
+            "No palace found",
+            hint="Run: mempalace init <dir> && mempalace mine <dir>",
+        )
     except BackendError as e:
         logger.error("Backend error opening palace at %s: %s", palace_path, e)
-        return None, {
-            "error": "Backend error",
-            "details": str(e),
-            "hint": "Check the selected backend configuration and availability.",
-        }
+        return None, _search_error_result(
+            "Backend error",
+            details=str(e),
+            hint="Check the selected backend configuration and availability.",
+        )
     except Exception as e:
         logger.error("No palace found at %s: %s", palace_path, e)
-        return None, {
-            "error": "No palace found",
-            "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
-        }
+        return None, _search_error_result(
+            "No palace found",
+            hint="Run: mempalace init <dir> && mempalace mine <dir>",
+        )
 
 
 def _query_drawers_with_filter_fallback(
@@ -1125,9 +1168,12 @@ def _query_drawers_with_filter_fallback(
             n_results=min(n_results * 15, 500),
             include=["documents", "metadatas", "distances"],
         )
-        fdocs, fmetas, fdists = [], [], []
-        for doc, meta, dist in zip(
-            _first_or_empty(raw, "documents"),
+        raw_docs = _first_or_empty(raw, "documents")
+        raw_ids = _aligned_query_ids(raw, len(raw_docs))
+        fids, fdocs, fmetas, fdists = [], [], [], []
+        for stored_drawer_id, doc, meta, dist in zip(
+            raw_ids,
+            raw_docs,
             _first_or_empty(raw, "metadatas"),
             _first_or_empty(raw, "distances"),
         ):
@@ -1138,10 +1184,16 @@ def _query_drawers_with_filter_fallback(
                 continue
             if source_file and meta.get("source_file") != source_file:
                 continue
+            fids.append(stored_drawer_id)
             fdocs.append(doc)
             fmetas.append(meta)
             fdists.append(dist)
-        return {"documents": [fdocs], "metadatas": [fmetas], "distances": [fdists]}
+        return {
+            "ids": [fids],
+            "documents": [fdocs],
+            "metadatas": [fmetas],
+            "distances": [fdists],
+        }
 
 
 def search_memories(
@@ -1235,7 +1287,7 @@ def search_memories(
             drawers_col, dkwargs, query, n_results, wing, room, source_file
         )
     except Exception as e:
-        return {"error": f"Search error: {e}"}
+        return _search_error_result(f"Search error: {e}")
 
     # Gather closet hits (best-per-source) to build a boost lookup.
     closet_boost_by_source: dict = {}  # source_file -> (rank, closet_dist, preview)
@@ -1271,8 +1323,11 @@ def search_memories(
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
-    for doc, meta, dist in zip(
-        _first_or_empty(drawer_results, "documents"),
+    drawer_docs = _first_or_empty(drawer_results, "documents")
+    stored_drawer_ids = _aligned_query_ids(drawer_results, len(drawer_docs))
+    for stored_drawer_id, doc, meta, dist in zip(
+        stored_drawer_ids,
+        drawer_docs,
         _first_or_empty(drawer_results, "metadatas"),
         _first_or_empty(drawer_results, "distances"),
     ):
@@ -1301,6 +1356,7 @@ def search_memories(
         # inverting the ranking so the best hybrid matches sort last.
         effective_dist = max(0.0, min(2.0, dist - boost))
         entry = {
+            "drawer_id": _result_drawer_id(meta, stored_drawer_id),
             "text": doc,
             "wing": meta.get("wing", "unknown"),
             "room": meta.get("room", "unknown"),
