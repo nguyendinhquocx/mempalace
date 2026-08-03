@@ -19,6 +19,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from .backends import PalaceNotFoundError
 from .collision_scan import assert_no_collisions
 from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
 from .normalize import normalize_conversations
@@ -418,9 +419,16 @@ def scan_convos(convo_dir: str) -> list:
     ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
     caller can tell why an apparent conversation directory yielded no files.
     """
-    convo_path = Path(convo_dir).expanduser().resolve()
+    # A direct conversation file is a valid source. For a file, feed only
+    # its basename through the existing directory validation loop.
+    requested_path = Path(convo_dir).expanduser()
+    single_file = requested_path.is_file()
+    convo_path = (requested_path.parent if single_file else requested_path).resolve()
+    scan_entries = (
+        [(str(convo_path), [], [requested_path.name])] if single_file else os.walk(convo_path)
+    )
     files = []
-    for root, dirs, filenames in os.walk(convo_path):
+    for root, dirs, filenames in scan_entries:
         dirs[:] = [d for d in dirs if d not in CONVO_SKIP_DIRS]
         for filename in filenames:
             if filename.endswith(".meta.json"):
@@ -830,6 +838,27 @@ def _normalize_convo_conversations(
     return conversations
 
 
+def _open_convo_collection(
+    palace_path: str,
+    *,
+    dry_run: bool,
+):
+    """Open the conversation collection without creating it during dry-run."""
+    if not dry_run:
+        return get_collection(palace_path)
+
+    try:
+        return get_collection(
+            palace_path,
+            create=False,
+            read_only=True,
+        )
+    except PalaceNotFoundError:
+        # A missing palace or uninitialized collection represents empty
+        # prior state to a dry-run. Do not create either one.
+        return None
+
+
 def _mine_convos_impl(
     convo_dir: str,
     palace_path: str,
@@ -871,7 +900,10 @@ def _mine_convos_impl(
         print("  DRY RUN — nothing will be filed")
     print(f"{'-' * 55}\n")
 
-    collection = get_collection(palace_path) if not dry_run else None
+    collection = _open_convo_collection(
+        palace_path,
+        dry_run=dry_run,
+    )
 
     # Bulk pre-fetch already-mined source_file -> stored mtime in one
     # paginated pass instead of `len(files)` separate WHERE-source_file
@@ -880,7 +912,7 @@ def _mine_convos_impl(
     # prefetch_mined_set() does the same decisions in a single scan; loop
     # body becomes an O(1) dict lookup + a cheap local mtime comparison.
     mined_mtimes: dict = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if not dry_run else {}
+        prefetch_mined_set(collection, extract_mode=extract_mode) if collection is not None else {}
     )
     # content_hash -> source_file for transcripts already filed. Repeated
     # exports from Claude/ChatGPT commonly land under a new filename each
@@ -888,7 +920,9 @@ def _mine_convos_impl(
     # source_file-keyed skip above ("mined_mtimes") never recognizes them —
     # this catches the same conversation reappearing at a new path.
     mined_content_hashes: dict = (
-        prefetch_content_hashes(collection, extract_mode=extract_mode) if not dry_run else {}
+        prefetch_content_hashes(collection, extract_mode=extract_mode)
+        if collection is not None
+        else {}
     )
 
     total_drawers = 0
@@ -909,7 +943,7 @@ def _mine_convos_impl(
         # Falling through re-mines: _file_chunks_locked purges this
         # source_file's stale drawers before inserting fresh ones, so this
         # never leaves duplicates behind.
-        if not dry_run and _is_unchanged_since_last_mine(source_file, mined_mtimes):
+        if _is_unchanged_since_last_mine(source_file, mined_mtimes):
             files_skipped += 1
             continue
 
