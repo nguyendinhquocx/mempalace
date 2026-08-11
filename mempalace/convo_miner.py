@@ -21,7 +21,12 @@ from typing import Optional
 
 from .backends import PalaceNotFoundError
 from .collision_scan import assert_no_collisions
-from .ids import ID_RECIPE, make_convo_drawer_id, make_convo_sentinel_id
+from .ids import (
+    ID_RECIPE,
+    make_convo_drawer_id,
+    make_convo_sentinel_id,
+    make_exchange_drawer_id,
+)
 from .normalize import normalize_conversations
 from .entities import entities_metadata
 from .palace import (
@@ -58,6 +63,82 @@ def _detect_hall_cached(content: str) -> str:
         if score > 0:
             scores[hall] = score
     return max(scores, key=scores.get) if scores else "general"
+
+
+def file_conversation_exchange(
+    collection,
+    *,
+    wing: str,
+    room: str,
+    text: str,
+    source_file: str,
+    agent: str,
+    authored_at: Optional[str] = None,
+    extra_metadata: Optional[dict] = None,
+) -> Optional[str]:
+    """File one verbatim conversation exchange as a single drawer.
+
+    Canonical write path for live agent integrations (e.g. Hermes) and
+    their backfills — both must route here so routing, normalization,
+    and metadata conventions stay identical between live and historical
+    ingest. Builds the same metadata the convo miner writes so hallway
+    traversal, entity search, and since/before date filters see
+    integration drawers exactly like mined ones.
+
+    ``wing`` and ``room`` are validated with the same ``sanitize_name``
+    rules the MCP write tools apply, but a failed name falls back
+    (``wing_general`` / ``conversations``) instead of erroring: this
+    path files *live* turns, and dropping a turn over a config typo
+    would break the verbatim / 100%-recall promise. The fallback is
+    logged at warning level so the misconfiguration is visible.
+
+    ``extra_metadata`` lets callers append integration-specific fields
+    (e.g. ``source`` / ``session_id``); keys that collide with the
+    canonical fields are ignored, so it cannot be used to overwrite or
+    drop them. Returns the drawer id, or None when ``text`` is empty
+    after stripping.
+    """
+    from .config import sanitize_name
+
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        wing = sanitize_name(wing, "wing")
+    except ValueError:
+        logger.warning(
+            "file_conversation_exchange: invalid wing %r — filing under wing_general", wing
+        )
+        wing = "wing_general"
+    try:
+        room = sanitize_name(room, "room")
+    except ValueError:
+        logger.warning(
+            "file_conversation_exchange: invalid room %r — filing under conversations", room
+        )
+        room = "conversations"
+    filed_at = datetime.now().isoformat()
+    drawer_id = make_exchange_drawer_id(wing, room, source_file, filed_at, text)
+    metadata = {
+        "wing": wing,
+        "room": room,
+        "hall": _detect_hall_cached(text),
+        "source_file": source_file,
+        "chunk_index": 0,
+        "added_by": agent,
+        "filed_at": filed_at,
+        "entities": entities_metadata(text),
+        "authored_at": authored_at if authored_at is not None else filed_at,
+        "ingest_mode": "convos",
+        "extract_mode": "exchange",
+        "normalize_version": NORMALIZE_VERSION,
+        "id_recipe": ID_RECIPE,
+    }
+    if extra_metadata:
+        for key, value in extra_metadata.items():
+            metadata.setdefault(key, value)
+    collection.upsert(ids=[drawer_id], documents=[text], metadatas=[metadata])
+    return drawer_id
 
 
 # File types that might contain conversations
@@ -412,12 +493,21 @@ def detect_convo_room(content: str) -> str:
 # =============================================================================
 
 
-def scan_convos(convo_dir: str) -> list:
+def scan_convos(convo_dir: str, include_subagents: bool = False) -> list:
     """Find all potential conversation files.
 
     Skips symlinks and oversized files. Each skipped symlink is logged to
     ``sys.stderr`` with a ``  SKIP: <relative-path> (symlink)`` line so the
     caller can tell why an apparent conversation directory yielded no files.
+
+    By default, directories named ``subagents`` are skipped: Claude Code
+    records Explore/Plan/Grep subagent transcripts there, and on typical
+    workspaces they outnumber main session files by one to two orders of
+    magnitude. Pass ``include_subagents=True`` to mine them anyway.
+
+    The match is case-insensitive on the directory name only (``subagents``
+    or ``Subagents``), so directories like ``mysubagents`` or
+    ``subagentsbackup`` are not affected.
     """
     # A direct conversation file is a valid source. For a file, feed only
     # its basename through the existing directory validation loop.
@@ -429,7 +519,11 @@ def scan_convos(convo_dir: str) -> list:
     )
     files = []
     for root, dirs, filenames in scan_entries:
-        dirs[:] = [d for d in dirs if d not in CONVO_SKIP_DIRS]
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in CONVO_SKIP_DIRS and (include_subagents or d.lower() != "subagents")
+        ]
         for filename in filenames:
             if filename.endswith(".meta.json"):
                 continue
@@ -739,12 +833,16 @@ def mine_convos(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    include_subagents: bool = False,
 ):
     """Mine a directory of conversation files into the palace.
 
     extract_mode:
         "exchange" — default exchange-pair chunking (Q+A = one unit)
         "general"  — general extractor: decisions, preferences, milestones, problems, emotions
+    include_subagents:
+        False (default) — skip Claude Code ``subagents/`` directories
+        True            — also mine subagent transcripts
 
     The real work is in :func:`_mine_convos_impl`; this wrapper holds the
     per-palace flock around it so two concurrent ``mempalace mine --mode
@@ -771,6 +869,7 @@ def mine_convos(
             limit=limit,
             dry_run=dry_run,
             extract_mode=extract_mode,
+            include_subagents=include_subagents,
         )
 
     with mine_palace_lock(palace_path):
@@ -782,6 +881,7 @@ def mine_convos(
             limit=limit,
             dry_run=dry_run,
             extract_mode=extract_mode,
+            include_subagents=include_subagents,
         )
 
 
@@ -867,6 +967,7 @@ def _mine_convos_impl(
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
+    include_subagents: bool = False,
 ):
     from .config import MempalaceConfig
 
@@ -886,10 +987,10 @@ def _mine_convos_impl(
     convo_path = Path(convo_dir).expanduser().resolve()
     wing = _resolve_wing(convo_path, wing)
 
-    files = scan_convos(convo_dir)
+    files = scan_convos(convo_dir, include_subagents=include_subagents)
 
     print(f"\n{'=' * 55}")
-    print("  MemPalace Mine — Conversations")
+    print("  MemPalace Mine -- Conversations")
     print(f"{'=' * 55}")
     print(f"  Wing:    {wing}")
     print(f"  Source:  {convo_path}")
@@ -897,7 +998,7 @@ def _mine_convos_impl(
     print(f"  Files:   {len(files)}{limit_suffix}")
     print(f"  Palace:  {palace_path}")
     if dry_run:
-        print("  DRY RUN — nothing will be filed")
+        print("  DRY RUN -- nothing will be filed")
     print(f"{'-' * 55}\n")
 
     collection = _open_convo_collection(
@@ -1018,9 +1119,9 @@ def _mine_convos_impl(
 
                 type_counts = Counter(c.get("memory_type", "general") for c in chunks)
                 types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
-                print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
+                print(f"    [DRY RUN] {filepath.name} -> {len(chunks)} memories ({types_str})")
             else:
-                print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
+                print(f"    [DRY RUN] {filepath.name} -> room:{room} ({len(chunks)} drawers)")
             total_drawers += len(chunks)
             # Track room counts
             if extract_mode == "general":

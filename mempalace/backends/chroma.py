@@ -2395,6 +2395,7 @@ class ChromaBackend(BaseBackend):
           — still used by callers not yet migrated.
         """
         palace_ref, collection_name, create, options = _normalize_get_collection_args(args, kwargs)
+        self.require_namespace_support(palace_ref)
 
         palace_path = palace_ref.local_path
         if palace_path is None:
@@ -2411,9 +2412,6 @@ class ChromaBackend(BaseBackend):
                 pass
 
         client = self._client(palace_path)
-        hnsw_space = "cosine"
-        if options and isinstance(options, dict):
-            hnsw_space = options.get("hnsw_space", hnsw_space)
 
         ef = self._resolve_embedding_function()
         ef_kwargs = {"embedding_function": ef} if ef is not None else {}
