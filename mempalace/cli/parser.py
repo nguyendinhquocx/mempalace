@@ -375,7 +375,7 @@ def main():
     p_hook_run.add_argument(
         "--harness",
         required=True,
-        choices=["claude-code", "codex"],
+        choices=["claude-code", "codex", "dsh"],
         help="Harness type (determines stdin JSON format)",
     )
 
@@ -397,9 +397,31 @@ def main():
         ),
     )
     p_rules.add_argument(
-        "--agent",
+        "--host",
         required=True,
-        help="Stable agent identity to render into the rules, e.g. mac-claude",
+        help="Stable machine label (lowercase), e.g. windows, mac, blade",
+    )
+    p_rules.add_argument(
+        "--harness",
+        required=True,
+        help="Runtime family (lowercase), e.g. claude, codex, grok, antigravity",
+    )
+    p_rules.add_argument(
+        "--project",
+        required=True,
+        help=(
+            "Example workspace/repo name (lowercase). The rendered block tells "
+            "the agent to compose host:harness:<project> from the current workspace"
+        ),
+    )
+    p_rules.add_argument(
+        "--mcp",
+        choices=["full", "light"],
+        default="full",
+        help=(
+            "Tool names in the block: 'full' (default, the 45-tool mempalace-mcp) or "
+            "'light' (palace_query / palace_exec / palace_coordinate)"
+        ),
     )
 
     # repair
@@ -743,7 +765,11 @@ def main():
     p_ls_watch.add_argument(
         "--state-file",
         default=None,
-        help="Persist the cursor here so a restart resumes exactly where it stopped",
+        help=(
+            "Persist the cursor here so a restart resumes exactly where it stopped. "
+            "When omitted with --agent, defaults to "
+            "~/.mempalace/watch/<agent>.json with '_' doubled and ':' sanitized to '_'"
+        ),
     )
     p_ls_watch.add_argument(
         "--from-start",
