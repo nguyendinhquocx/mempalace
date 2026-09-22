@@ -9,7 +9,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Bug Fixes
+- **The legacy `mempalace repair` no longer runs without the palace lease, so a
+  hook miner can no longer destroy a repair that is already half done.**
+  `cmd_repair` extracted every drawer and copied the whole palace to
+  `<palace>.backup` with no `mine_palace_lock` held, and only the per-batch
+  acquires inside the rebuild contended. On a large palace that is minutes of
+  work during which a `mempalace mine` started by a hook could take the lease,
+  after which the rebuild failed with `MineAlreadyRunning` and the extraction
+  and the backup were both discarded. The lease is now held across the whole
+  pass and contention is reported with the holder's identity before anything is
+  read or copied - what `rebuild_index` and `rebuild_from_sqlite` already did.
+  (#2562, #2569)
 
+
+- **The stdio MCP servers no longer exit on a line `json.loads` cannot load.** An
+  integer past Python's digit limit raises `ValueError` and nesting too deep to
+  parse raises `RecursionError`. Neither the full server's stdio loop nor the light
+  server's caught them, so one such line ended the session. The full server
+  (`mempalace-mcp` with no hub running) now answers it with `-32700`, as the hub's
+  HTTP transport does, and `mempalace-light-mcp` skips it, as it skips invalid
+  JSON. (#2556)
 - **A `known_entities.json` write no longer appears to hang on Windows when the
   directory refuses a temporary file.** `_publish_registry` falls back to writing
   in place when the directory takes no new name, and it learned that from the
@@ -29,6 +48,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   `mempalace daemon start --foreground` and no `--palace` now writes `mcp_tool`
   knowledge-graph facts beside its palace, not to
   `~/.mempalace/knowledge_graph.sqlite3`. (#2528)
+- **`mempalace-mcp` now answers the requests it could not serve.** When its hub
+  was gone and its own server could not start, every request was dropped and the
+  client waited on each one. That happens with a `--backend` that names no
+  backend, or with a storage stack that fails to import; the failed import also
+  sent later answers to stderr. These requests now get an error naming why. A line
+  that does not parse gets `-32700`, and JSON that is not an object gets `-32600`.
+  A hub answer that breaks off counts as a failed hub call in the proxy and the
+  full server. A call that changes state, `mempalace_memories_filed_away`
+  included, is then not replayed, and a read is served locally. `--palace` or
+  `--backend` with no value is refused at startup. (#2554)
 
 ### Upgrade notes
 
