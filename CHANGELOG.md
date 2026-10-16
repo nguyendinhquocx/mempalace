@@ -8,6 +8,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **`closet_llm` reads `MEMPALACE_LLM_ENDPOINT`, `MEMPALACE_LLM_MODEL` and
+  `MEMPALACE_LLM_KEY` instead of the generic `LLM_ENDPOINT`, `LLM_MODEL` and
+  `LLM_KEY`.** Generic names are often set for other tools, and reading them
+  could send drawer content to an endpoint nobody chose for MemPalace. Rename the
+  variables; when only the old names are set, the command says so. A non-local
+  endpoint also needs `--accept-external-llm` or `MEMPALACE_ACCEPT_EXTERNAL_LLM=1`,
+  the same consent `init`, `rooms propose` and `kg normalize` ask for, and every
+  LLM provider now refuses a non-local endpoint until that consent is given.
+- **The legacy shell hooks under `hooks/` no longer read `MEMPAL_VERBOSE`.**
+  `mempal_save_hook.sh` and `mempal_precompact_hook.sh` now hand off to
+  `mempalace hook run` like the plugin hooks, through a shared
+  `mempal_hook_run.sh` that must stay next to them. To have the Stop hook block
+  and ask the AI to save instead of saving silently, set `hooks.silent_save` to
+  `false` in `~/.mempalace/config.json`. When no interpreter can import
+  mempalace, the hooks print `{}` and exit 0 as before.
+- **Conversation mining no longer spell-corrects your messages by default.**
+  When the optional `autocorrect` package was installed, chat imports rewrote
+  user turns before filing them. Turns are now stored as written. To keep the
+  old behaviour, set `"convo": {"spellcheck": true}` in `config.json` or
+  `MEMPALACE_CONVO_SPELLCHECK=1`; it corrects user messages only, and every
+  drawer from a file whose text the speller changed carries
+  `spellcheck_user` in its `transforms` metadata. Drawers filed before this
+  release keep their corrected text until the source file is mined again.
+- **`mempalace_search` no longer applies a default distance cutoff.** It used to
+  drop every hit past cosine distance 1.5, which could hide a relevant but
+  distant drawer. Pass `max_distance` to keep a cutoff; it is now read on the
+  cosine scale (0 = identical, 2 = opposite) whatever metric the palace uses,
+  and the response reports how many hits it dropped in
+  `filtered_by_max_distance`. In `candidate_strategy: "union"`, a lexical-only
+  hit whose vector distance can't be computed is kept with `distance: null` and
+  `fallback_reason: "distance_unavailable"` instead of disappearing.
+
+### Bug Fixes
+
+- **A mine stops when it cannot read which files are already filed.** The
+  already-mined check used to answer "not mined" on any palace read error, so a
+  re-mine re-filed files it could not see. It now raises `MinedSetUnavailable`
+  and the project, conversation and format miners all abort the run on it. A
+  pass that crashed between batches (fewer drawers than the largest
+  `chunk_total` any of them names) reads as unfinished on every check.
+- ChatGPT imports file the branch the conversation ended on (`current_node`),
+  not the first draft of every regenerated or edited turn.
+- A Slack message with `"user": null` is filed under `unknown` instead of
+  failing the whole export.
+- **Conversation drawers now say when their text is not the source as
+  written.** Mining a chat transcript truncates long tool output, leaves out
+  some tool results, cuts tool calls down to one line, strips UI chrome, drops
+  thinking, image and system content, and adds its own markers, and none of
+  that was recorded. Every drawer from a file whose parse did any of these now
+  carries a `transforms` field listing the RFC 002 names, sorted and
+  comma-joined (for example `strip_tool_chrome,tool_result_truncate`). The
+  stamp covers the whole file, so in a bundle export it also lands on
+  conversations the step did not touch. The text itself is unchanged. Drawers
+  filed before this release carry no stamp until their file is mined again.
 
 ---
 

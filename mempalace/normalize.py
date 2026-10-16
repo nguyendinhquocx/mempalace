@@ -24,8 +24,10 @@ import json
 import os
 import re
 import stat
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 
 class UnparsedCodexTranscriptError(ValueError):
@@ -37,6 +39,17 @@ class UnparsedCodexTranscriptError(ValueError):
 _SLACK_PROVENANCE_FOOTER = (
     "\n[source: slack-export | multi-party chat — speaker roles are positional, not verified]"
 )
+
+# The ``NormalizeRun`` of an open ``recording_transforms`` block; None (the
+# default) records nothing and keeps user turns as written.
+_NORMALIZE_RUN = ContextVar("_NORMALIZE_RUN", default=None)
+
+
+def _record(transform: str) -> None:
+    """Note that the parse in progress applied an RFC 002 transformation."""
+    run = _NORMALIZE_RUN.get()
+    if run is not None:
+        run.applied.add(transform)
 
 
 # ─── Noise stripping ─────────────────────────────────────────────────────
@@ -100,6 +113,10 @@ _HOOK_LINE_RE = re.compile(
 # "… +N lines" collapsed-output marker, line-anchored.
 _COLLAPSED_LINES_RE = re.compile(r"(?m)^(?:> )?…\s*\+\d+ lines.*\n?")
 
+# Claude Code collapsed-output chrome "[N tokens] (ctrl+o to expand)". Narrow
+# shape — a bare "(ctrl+o to expand)" in user prose stays intact.
+_CTRL_O_RE = re.compile(r"\s*\[\d+\s+tokens?\]\s*\(ctrl\+o to expand\)")
+
 
 def strip_noise(text: str) -> str:
     """Remove system tags, hook output, and Claude Code UI chrome from text.
@@ -107,15 +124,18 @@ def strip_noise(text: str) -> str:
     All patterns are line-anchored. User prose that happens to mention these
     strings inline (e.g., documenting them) is preserved verbatim.
     """
-    for pat in _NOISE_TAG_PATTERNS:
-        text = pat.sub("", text)
-    for pat in _NOISE_LINE_PATTERNS:
-        text = pat.sub("", text)
-    text = _HOOK_LINE_RE.sub("", text)
-    text = _COLLAPSED_LINES_RE.sub("", text)
-    # Strip the Claude Code collapsed-output chrome "[N tokens] (ctrl+o to expand)".
-    # Narrow shape — a bare "(ctrl+o to expand)" in user prose stays intact.
-    text = re.sub(r"\s*\[\d+\s+tokens?\]\s*\(ctrl\+o to expand\)", "", text)
+    removed = 0
+    for pat in (
+        *_NOISE_TAG_PATTERNS,
+        *_NOISE_LINE_PATTERNS,
+        _HOOK_LINE_RE,
+        _COLLAPSED_LINES_RE,
+        _CTRL_O_RE,
+    ):
+        text, n = pat.subn("", text)
+        removed += n
+    if removed:
+        _record("strip_tool_chrome")
     # Collapse runs of blank lines created by the removals
     text = re.sub(r"\n{4,}", "\n\n\n", text)
     return text.strip()
@@ -125,6 +145,14 @@ def _read_transcript_file(filepath: str) -> str:
     """Read a transcript source file with the same safety checks normalize()
     and normalize_conversations() both need: no symlinks, regular files only,
     size-capped, BOM-tolerant.
+    """
+    return _read_transcript_file_with_mtime(filepath)[0]
+
+
+def _read_transcript_file_with_mtime(filepath: str) -> Tuple[str, float]:
+    """``_read_transcript_file`` plus the mtime from the ``fstat`` taken
+    before the read. A stat after the read can record an mtime for bytes
+    the read never saw, and the next mine then skips the appended tail.
     """
     # O_NONBLOCK keeps the "not a regular file" check below reachable: a
     # blocking open of a FIFO waits in the kernel for a writer, so the
@@ -151,7 +179,7 @@ def _read_transcript_file(filepath: str) -> str:
             raise IOError(f"file too large ({file_stat.st_size // (1024 * 1024)} MB)")
         with os.fdopen(fd, "r", encoding="utf-8-sig", errors="replace") as f:
             fd = -1
-            return f.read()
+            return f.read(), file_stat.st_mtime
     except OSError as e:
         raise IOError(f"Could not read {filepath}: {e}") from e
     finally:
@@ -209,8 +237,23 @@ def normalize_conversations(filepath: str) -> list:
     always normalize to one conversation, so this returns a one-element
     list for those — identical dedup granularity to before.
     """
-    content = _read_transcript_file(filepath)
+    return normalize_conversations_with_mtime(filepath)[0]
 
+
+def normalize_conversations_with_mtime(filepath: str) -> Tuple[list, float]:
+    """``normalize_conversations`` plus the mtime of the bytes it read."""
+    content, mtime = _read_transcript_file_with_mtime(filepath)
+    run = _NORMALIZE_RUN.get()
+    if run is not None and run.spellcheck:
+        token = _NORMALIZE_RUN.set(None)
+        try:
+            run.verbatim = _split_conversations(content, filepath)
+        finally:
+            _NORMALIZE_RUN.reset(token)
+    return _split_conversations(content, filepath), mtime
+
+
+def _split_conversations(content: str, filepath: str) -> list:
     if not content.strip():
         return []
 
@@ -237,16 +280,32 @@ def _try_normalize_json(content: str) -> Optional[str]:
     return "\n\n".join(split)
 
 
+def _attempt(parser, source):
+    """Run one parser, keeping the transformations it recorded only when it
+    parsed ``source``: a parser that gives up leaves the text unchanged."""
+    run = _NORMALIZE_RUN.get()
+    if run is None:
+        return parser(source)
+    kept, run.applied = run.applied, set()
+    try:
+        result = parser(source)
+    finally:
+        tried, run.applied = run.applied, kept
+    if result:
+        kept |= tried
+    return result
+
+
 def _try_normalize_json_split(content: str) -> Optional[list]:
     """Try all known JSON chat schemas, returning each conversation found as
     a separate list entry (bundle formats) or a single-element list.
     """
 
-    normalized = _try_claude_code_jsonl(content)
+    normalized = _attempt(_try_claude_code_jsonl, content)
     if normalized:
         return [normalized]
 
-    normalized = _try_codex_jsonl(content)
+    normalized = _attempt(_try_codex_jsonl, content)
     if normalized:
         return [normalized]
 
@@ -265,11 +324,11 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
                 "refusing raw JSON fallback"
             )
 
-    normalized = _try_gemini_jsonl(content)
+    normalized = _attempt(_try_gemini_jsonl, content)
     if normalized:
         return [normalized]
 
-    normalized = _try_pi_jsonl(content)
+    normalized = _attempt(_try_pi_jsonl, content)
     if normalized:
         return [normalized]
 
@@ -278,20 +337,20 @@ def _try_normalize_json_split(content: str) -> Optional[list]:
     except json.JSONDecodeError:
         return None
 
-    normalized = _try_gemini_json(data)
+    normalized = _attempt(_try_gemini_json, data)
     if normalized:
         return [normalized]
 
-    split = _try_claude_ai_json_split(data)
+    split = _attempt(_try_claude_ai_json_split, data)
     if split:
         return split
 
-    split = _try_chatgpt_export_json_split(data)
+    split = _attempt(_try_chatgpt_export_json_split, data)
     if split:
         return split
 
     for parser in (_try_chatgpt_json, _try_continue_json, _try_slack_json):
-        normalized = parser(data)
+        normalized = _attempt(parser, data)
         if normalized:
             return [normalized]
 
@@ -312,6 +371,8 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
         if not isinstance(entry, dict):
             continue
         msg_type = entry.get("type", "")
+        # system, summary and other entries carry session bookkeeping and UI
+        # chrome rather than conversation, so skipping them is not recorded.
         message = entry.get("message", {})
         if not isinstance(message, dict):
             continue
@@ -342,6 +403,8 @@ def _try_claude_code_jsonl(content: str) -> Optional[str]:
                     messages[-1] = (prev_role, prev_text + "\n" + text)
                 elif not is_tool_only:
                     messages.append(("user", text))
+                else:
+                    _record("tool_result_omitted")
         elif msg_type == "assistant":
             text = _extract_content(msg_content, tool_use_map=tool_use_map)
             if text:
@@ -383,11 +446,21 @@ def _try_codex_jsonl(content: str) -> Optional[str]:
             has_session_meta = True
             continue
 
-        if entry_type != "event_msg":
-            continue
-
         payload = entry.get("payload", {})
         if not isinstance(payload, dict):
+            continue
+
+        if entry_type == "response_item":
+            # Messages repeat the event_msg turns; tool calls, their output
+            # and reasoning appear only here and are not filed.
+            item_type = payload.get("type", "")
+            if item_type.endswith("_output"):
+                _record("tool_result_omitted")
+            elif item_type != "message":
+                _record("conversations.content_block_drop")
+            continue
+
+        if entry_type != "event_msg":
             continue
 
         payload_type = payload.get("type", "")
@@ -462,6 +535,9 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
             text = block.get("text", "")
             if isinstance(text, str) and text.strip():
                 parts.append(text)
+            elif any(key != "text" for key in block):
+                # functionCall, functionResponse, inlineData and the like.
+                _record("conversations.content_block_drop")
         if not parts:
             continue
         joined = "\n".join(parts)
@@ -511,6 +587,10 @@ def _try_pi_jsonl(content: str) -> Optional[str]:
             continue
 
         role = message.get("role", "")
+        if role == "toolResult":
+            if message.get("content"):
+                _record("tool_result_omitted")
+            continue
         text = _extract_content(message.get("content", ""))
 
         if role == "user" and text:
@@ -571,6 +651,7 @@ def _try_gemini_json(data) -> Optional[str]:
         # Extract text — try "parts" first (Gemini API), then "content" (flat).
         text = ""
         parts = item.get("parts")
+        joined_parts = 0
         if isinstance(parts, list):
             text_parts = []
             for p in parts:
@@ -578,6 +659,10 @@ def _try_gemini_json(data) -> Optional[str]:
                     text_parts.append(p)
                 elif isinstance(p, dict) and "text" in p:
                     text_parts.append(p["text"])
+                elif p:
+                    # inlineData, functionCall, functionResponse and the like.
+                    _record("conversations.content_block_drop")
+            joined_parts = len([t for t in text_parts if t])
             text = " ".join(text_parts).strip()
         else:
             text = _extract_content(item.get("content", ""))
@@ -585,6 +670,8 @@ def _try_gemini_json(data) -> Optional[str]:
         if not text:
             continue
 
+        if role in ("user", "model", "assistant") and joined_parts > 1:
+            _record("line_join_spaces")
         if role == "user":
             messages.append(("user", text))
         elif role == "model":
@@ -594,6 +681,9 @@ def _try_gemini_json(data) -> Optional[str]:
             # Defensive: some hand-crafted exports use "assistant" even
             # for Gemini sessions. Accept but don't flip has_model_role.
             messages.append(("assistant", text))
+        else:
+            # System and other roles are not filed.
+            _record("conversations.content_block_drop")
 
     # Disambiguator: must have seen at least one role="model" entry.
     # This prevents the Gemini parser from claiming Claude/ChatGPT data.
@@ -630,17 +720,23 @@ def _try_claude_ai_json_split(data) -> Optional[list]:
             if not isinstance(convo, dict):
                 continue
             chat_msgs = convo.get("chat_messages") or convo.get("messages", [])
-            messages = _collect_claude_messages(chat_msgs)
-            if len(messages) >= 2:
-                transcripts.append(_messages_to_transcript(messages))
+            transcript = _attempt(_claude_conversation, chat_msgs)
+            if transcript:
+                transcripts.append(transcript)
         if transcripts:
             return transcripts
         return None
 
     # Flat messages list
-    messages = _collect_claude_messages(data)
+    transcript = _claude_conversation(data)
+    return [transcript] if transcript else None
+
+
+def _claude_conversation(chat_msgs) -> Optional[str]:
+    """The transcript of one Claude.ai message list, or None below two turns."""
+    messages = _collect_claude_messages(chat_msgs)
     if len(messages) >= 2:
-        return [_messages_to_transcript(messages)]
+        return _messages_to_transcript(messages)
     return None
 
 
@@ -657,10 +753,15 @@ def _collect_claude_messages(items) -> list:
             continue
         role = item.get("role") or item.get("sender", "")
         text = _extract_content(item.get("content", "")) or (item.get("text") or "").strip()
-        if role in ("user", "human") and text:
+        if not text:
+            continue
+        if role in ("user", "human"):
             messages.append(("user", text))
-        elif role in ("assistant", "ai") and text:
+        elif role in ("assistant", "ai"):
             messages.append(("assistant", text))
+        else:
+            # System and other roles are not filed.
+            _record("conversations.content_block_drop")
     return messages
 
 
@@ -675,8 +776,43 @@ def _try_chatgpt_json(data) -> Optional[str]:
     if not isinstance(data, dict) or not isinstance(data.get("mapping"), dict):
         return None
     mapping = data["mapping"]
-    messages = []
-    # Find root: prefer node with parent=None AND no message (synthetic root)
+    # The branch the conversation ended on, so drafts and regenerations the
+    # user moved away from are not filed. Without a usable current_node, the
+    # first-child walk from the root.
+    messages = _attempt(
+        _chatgpt_conversation, _chatgpt_active_path(mapping, data.get("current_node"))
+    ) or _attempt(_chatgpt_conversation, _chatgpt_root_path(mapping))
+    if messages:
+        return _messages_to_transcript(messages)
+    return None
+
+
+def _chatgpt_conversation(path: list) -> Optional[list]:
+    """The messages along ``path``, or None when there are fewer than two."""
+    messages = _chatgpt_messages(path)
+    return messages if len(messages) >= 2 else None
+
+
+# Node ids index a dict and a visited set, so anything unhashable (a nested
+# object rather than an id) ends a ChatGPT tree walk.
+
+
+def _chatgpt_active_path(mapping: dict, current_id) -> list:
+    path = []
+    visited = set()
+    while isinstance(current_id, str) and current_id not in visited:
+        visited.add(current_id)
+        node = mapping.get(current_id)
+        if not isinstance(node, dict):
+            break
+        path.append(node)
+        current_id = node.get("parent")
+    path.reverse()
+    return path
+
+
+def _chatgpt_root_path(mapping: dict) -> list:
+    # Prefer a root with parent=None AND no message (synthetic root).
     root_id = None
     fallback_root = None
     for node_id, node in mapping.items():
@@ -688,37 +824,49 @@ def _try_chatgpt_json(data) -> Optional[str]:
                 break
             elif fallback_root is None:
                 fallback_root = node_id
-    if not root_id:
-        root_id = fallback_root
-    if root_id:
-        current_id = root_id
-        visited = set()
-        while current_id and current_id not in visited:
-            visited.add(current_id)
-            node = mapping.get(current_id)
-            if not isinstance(node, dict):
-                break
-            msg = node.get("message")
-            if isinstance(msg, dict):
-                author = msg.get("author")
-                role = author.get("role", "") if isinstance(author, dict) else ""
-                content = msg.get("content", {})
-                parts = content.get("parts") if isinstance(content, dict) else None
-                if not isinstance(parts, list):
-                    parts = []
-                text = " ".join(str(p) for p in parts if isinstance(p, str) and p).strip()
-                if role == "user" and text:
-                    messages.append(("user", text))
-                elif role == "assistant" and text:
-                    messages.append(("assistant", text))
-            children = node.get("children")
-            next_id = children[0] if isinstance(children, list) and children else None
-            # Node ids index a dict and a visited set, so anything unhashable
-            # (a nested child object rather than an id) ends the walk.
-            current_id = next_id if isinstance(next_id, str) else None
-    if len(messages) >= 2:
-        return _messages_to_transcript(messages)
-    return None
+    path = []
+    visited = set()
+    current_id = root_id or fallback_root
+    while current_id and current_id not in visited:
+        visited.add(current_id)
+        node = mapping.get(current_id)
+        if not isinstance(node, dict):
+            break
+        path.append(node)
+        children = node.get("children")
+        next_id = children[0] if isinstance(children, list) and children else None
+        current_id = next_id if isinstance(next_id, str) else None
+    return path
+
+
+def _chatgpt_messages(path: list) -> list:
+    messages = []
+    for node in path:
+        msg = node.get("message")
+        if not isinstance(msg, dict):
+            continue
+        author = msg.get("author")
+        role = author.get("role", "") if isinstance(author, dict) else ""
+        content = msg.get("content", {})
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(parts, list):
+            parts = []
+        texts = [p for p in parts if isinstance(p, str) and p]
+        if len(texts) < len([p for p in parts if p]):
+            # Image pointers and other non-text parts.
+            _record("conversations.content_block_drop")
+        text = " ".join(texts).strip()
+        if not text:
+            continue
+        if role in ("user", "assistant"):
+            if len(texts) > 1:
+                _record("line_join_spaces")
+            messages.append((role, text))
+        elif role == "tool":
+            _record("tool_result_omitted")
+        else:
+            _record("conversations.content_block_drop")
+    return messages
 
 
 def _try_chatgpt_export_json_split(data) -> Optional[list]:
@@ -747,7 +895,7 @@ def _try_chatgpt_export_json_split(data) -> Optional[list]:
 
     transcripts = []
     for convo in data:
-        transcript = _try_chatgpt_json(convo)
+        transcript = _attempt(_try_chatgpt_json, convo)
         if transcript:
             transcripts.append(transcript)
     # None, not [], so an array of other JSON still reaches the later parsers.
@@ -773,12 +921,18 @@ def _try_slack_json(data) -> Optional[str]:
     for item in data:
         if not isinstance(item, dict) or item.get("type") != "message":
             continue
-        raw_user_id = item.get("user", item.get("username", ""))
+        # Exports carry "user": null for bots and deleted accounts; file
+        # those turns under "unknown" rather than dropping or crashing on them.
+        raw_user_id = str(item.get("user") or item.get("username") or "")
         # Sanitize speaker ID: strip brackets, newlines, and control chars
         # to prevent chunk-boundary injection via crafted exports
-        user_id = re.sub(r"[\[\]\n\r\x00-\x1f]", "_", raw_user_id).strip()
-        text = item.get("text", "").strip()
-        if not text or not user_id:
+        user_id = re.sub(r"[\[\]\n\r\x00-\x1f]", "_", raw_user_id).strip() or "unknown"
+        if item.get("files") or item.get("attachments"):
+            # Uploaded files and link attachments are not filed.
+            _record("conversations.content_block_drop")
+        text = item.get("text")
+        text = text.strip() if isinstance(text, str) else ""
+        if not text:
             continue
         if user_id not in seen_users:
             # Alternate roles so exchange chunking works with any number of speakers
@@ -792,6 +946,8 @@ def _try_slack_json(data) -> Optional[str]:
         # Prefix with speaker ID so the original author is preserved
         messages.append((seen_users[user_id], f"[{user_id}] {text}"))
     if len(messages) >= 2:
+        _record("speaker_role_assignment")
+        _record("synthesized_marker")
         return _messages_to_transcript(messages) + _SLACK_PROVENANCE_FOOTER
     return None
 
@@ -824,6 +980,8 @@ def _try_continue_json(data) -> Optional[str]:
                 if isinstance(block, dict):
                     if block.get("type") == "text":
                         parts.append(block.get("text", ""))
+                    else:
+                        _record("conversations.content_block_drop")
                 elif isinstance(block, str):
                     parts.append(block)
             text = "\n".join(p for p in parts if p).strip()
@@ -844,7 +1002,12 @@ def _try_continue_json(data) -> Optional[str]:
             if messages and messages[-1][0] == "assistant":
                 prev_role, prev_text = messages[-1]
                 messages[-1] = (prev_role, prev_text + "\n" + f"[tool] {text}")
-        # Skip system and other roles
+                _record("synthesized_marker")
+            else:
+                _record("tool_result_omitted")
+        else:
+            # System and other roles are not filed.
+            _record("conversations.content_block_drop")
 
     if len(messages) >= 2:
         return _messages_to_transcript(messages)
@@ -879,6 +1042,9 @@ def _extract_content(content, tool_use_map: dict = None) -> str:
                     formatted = _format_tool_result(result_content, tname)
                     if formatted:
                         parts.append(formatted)
+                else:
+                    # Thinking, image, document and other blocks are not filed.
+                    _record("conversations.content_block_drop")
         return "\n".join(p for p in parts if p).strip()
     if isinstance(content, dict):
         return content.get("text", "").strip()
@@ -894,7 +1060,9 @@ def _format_tool_use(block: dict) -> str:
 
     if name == "Bash":
         cmd = inp.get("command", "")
+        _note_input_left_out(inp, ("command",))
         if len(cmd) > 200:
+            _record("conversations.tool_input_summarize")
             cmd = cmd[:200] + "..."
         return f"[Bash] {cmd}"
 
@@ -903,35 +1071,53 @@ def _format_tool_use(block: dict) -> str:
         offset = inp.get("offset")
         limit = inp.get("limit")
         if offset is not None and limit is not None:
+            _note_input_left_out(inp, ("file_path", "offset", "limit"))
             try:
                 return f"[Read {path}:{offset}-{int(offset) + int(limit)}]"
             except (ValueError, TypeError):
                 return f"[Read {path}:{offset}+{limit}]"
+        _note_input_left_out(inp, ("file_path",))
         return f"[Read {path}]"
 
     if name == "Grep":
         pattern = inp.get("pattern", "")
-        target = inp.get("path") or inp.get("glob") or ""
-        return f"[Grep] {pattern} in {target}"
+        target_key = "path" if inp.get("path") else "glob"
+        _note_input_left_out(inp, ("pattern", target_key))
+        return f"[Grep] {pattern} in {inp.get(target_key) or ''}"
 
     if name == "Glob":
         pattern = inp.get("pattern", "")
+        _note_input_left_out(inp, ("pattern",))
         return f"[Glob] {pattern}"
 
     if name in ("Edit", "Write"):
         path = inp.get("file_path", "?")
+        _note_input_left_out(inp, ("file_path",))
         return f"[{name} {path}]"
 
     # Unknown tool — serialize input, truncate
     summary = json.dumps(inp, separators=(",", ":"))
     if len(summary) > 200:
+        _record("conversations.tool_input_summarize")
         summary = summary[:200] + "..."
     return f"[{name}] {summary}"
+
+
+def _note_input_left_out(inp: dict, shown: tuple) -> None:
+    """Record a tool call whose one-liner leaves out part of its input."""
+    if any(value not in (None, "", [], {}) for key, value in inp.items() if key not in shown):
+        _record("conversations.tool_input_summarize")
 
 
 _TOOL_RESULT_MAX_LINES_BASH = 20  # head and tail line count
 _TOOL_RESULT_MAX_MATCHES = 20  # Grep/Glob cap
 _TOOL_RESULT_MAX_BYTES = 2048  # fallback cap for unknown tools
+
+
+def _record_truncation() -> None:
+    """A tool result was cut, with a marker string where the rest was."""
+    _record("tool_result_truncate")
+    _record("synthesized_marker")
 
 
 def _format_tool_result(content, tool_name: str) -> str:
@@ -952,6 +1138,9 @@ def _format_tool_result(content, tool_name: str) -> str:
                 parts.append(item.get("text", ""))
             elif isinstance(item, str):
                 parts.append(item)
+            elif isinstance(item, dict):
+                # Images and other non-text blocks of a tool result.
+                _record("conversations.content_block_drop")
         text = "\n".join(parts)
     else:
         text = str(content) if content else ""
@@ -962,6 +1151,7 @@ def _format_tool_result(content, tool_name: str) -> str:
 
     # Read/Edit/Write — omit result (content is in palace or git)
     if tool_name in ("Read", "Edit", "Write"):
+        _record("tool_result_omitted")
         return ""
 
     lines = text.split("\n")
@@ -971,6 +1161,7 @@ def _format_tool_result(content, tool_name: str) -> str:
         n = _TOOL_RESULT_MAX_LINES_BASH
         if len(lines) <= n * 2:
             return "→ " + "\n→ ".join(lines)
+        _record_truncation()
         head = lines[:n]
         tail = lines[-n:]
         omitted = len(lines) - 2 * n
@@ -987,35 +1178,73 @@ def _format_tool_result(content, tool_name: str) -> str:
         cap = _TOOL_RESULT_MAX_MATCHES
         if len(lines) <= cap:
             return "→ " + "\n→ ".join(lines)
+        _record_truncation()
         kept = lines[:cap]
         remaining = len(lines) - cap
         return "→ " + "\n→ ".join(kept) + f"\n→ ... [{remaining} more matches]"
 
     # Unknown — byte cap
     if len(text) > _TOOL_RESULT_MAX_BYTES:
+        _record_truncation()
         return "→ " + text[:_TOOL_RESULT_MAX_BYTES] + f"... [truncated, {len(text)} chars]"
     return "→ " + text
 
 
-def _messages_to_transcript(messages: list, spellcheck: bool = True) -> str:
-    """Convert [(role, text), ...] to transcript format with > markers."""
-    if spellcheck:
-        try:
-            from mempalace.spellcheck import spellcheck_user_text
+class NormalizeRun:
+    """What one file's parse inside ``recording_transforms`` did: the RFC 002
+    transformations it applied (``applied``), and, with spell correction on,
+    the conversations as written (``verbatim``), parsed from the same bytes so
+    callers can hash the uncorrected text."""
 
-            _fix = spellcheck_user_text
-        except ImportError:
-            _fix = None
-    else:
-        _fix = None
+    def __init__(self, spellcheck: bool):
+        self.spellcheck = spellcheck
+        self.applied: set = set()
+        self.verbatim: Optional[list] = None
 
+    @property
+    def transforms(self) -> str:
+        """The ``transforms`` drawer metadata value for ``applied``."""
+        # Lazy: importing the sources package loads its adapter registry.
+        from mempalace.sources.transforms import format_transforms
+
+        return format_transforms(self.applied)
+
+
+@contextmanager
+def recording_transforms(spellcheck: bool = False):
+    """Record the transformations applied to conversations parsed inside this
+    block, and spell-correct their user messages when ``spellcheck`` is on.
+
+    Yields a ``NormalizeRun``. Turns are kept as written otherwise.
+    """
+    run = NormalizeRun(spellcheck)
+    token = _NORMALIZE_RUN.set(run)
+    try:
+        yield run
+    finally:
+        _NORMALIZE_RUN.reset(token)
+
+
+def _messages_to_transcript(messages: list) -> str:
+    """Convert [(role, text), ...] to transcript format with > markers.
+
+    Turns are kept as written unless the caller opted in to spell correction
+    with ``recording_transforms(spellcheck=True)``, which only touches user
+    messages.
+    """
+    run = _NORMALIZE_RUN.get()
     lines = []
     i = 0
     while i < len(messages):
         role, text = messages[i]
         if role == "user":
-            if _fix is not None:
-                text = _fix(text)
+            if run is not None and run.spellcheck:
+                from mempalace.spellcheck import spellcheck_user_text
+
+                corrected = spellcheck_user_text(text)
+                if corrected != text:
+                    run.applied.add("spellcheck_user")
+                text = corrected
             lines.append(f"> {text}")
             if i + 1 < len(messages) and messages[i + 1][0] == "assistant":
                 lines.append(messages[i + 1][1])
