@@ -356,10 +356,12 @@ TOOLS = {
                 },
                 "include_media": {
                     "type": "boolean",
+                    "x-mempalace-strict": True,
                     "description": "Opt in to local image/audio/video assets and text in the shared EmbeddingGemma 2 space. Returns media paths and metadata with cosine ranking.",
                 },
                 "query_task": {
                     "type": "string",
+                    "x-mempalace-strict": True,
                     "enum": ["search", "code"],
                     "description": "EmbeddingGemma 2 task prompt: general search (default) or native code retrieval.",
                 },
@@ -548,6 +550,7 @@ TOOLS = {
                 },
                 "include_ignored": {
                     "type": "array",
+                    "x-mempalace-strict": True,
                     "items": {"type": "string"},
                     "description": (
                         "Project-relative paths to scan even if ignored, matching CLI "
@@ -556,6 +559,7 @@ TOOLS = {
                 },
                 "include_subagents": {
                     "type": "boolean",
+                    "x-mempalace-strict": True,
                     "description": (
                         "Also mine Claude Code subagent transcripts (subagents/ dirs), "
                         "matching CLI --include-subagents. Convos mode only; ignored by "
@@ -568,7 +572,7 @@ TOOLS = {
         "handler": tool_mine,
     },
     "mempalace_delete_by_source": {
-        "description": "Bulk-delete every drawer mined from one source_file (exact match). Use to clean up benchmark/test data accidentally mined into a user wing (#1722). Returns a dry-run match count and sample by default; pass dry_run=false to commit. Irreversible; a commit also removes those drawers' earlier revisions.",
+        "description": "Bulk-delete every drawer mined from one source_file (exact match). Use to clean up benchmark/test data accidentally mined into a user wing. Returns a dry-run match count and sample by default; pass dry_run=false to commit. Irreversible; a commit also removes those drawers' earlier revisions.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -609,6 +613,14 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "drawer_id": {"type": "string", "description": "ID of the drawer to fetch"},
+                "include_source_bytes": {
+                    "type": "boolean",
+                    "description": (
+                        "Also return `source_bytes_base64`: the drawer's exact source bytes, "
+                        "for a drawer whose metadata names a `source_encoding`. Responses "
+                        "show a byte that is not valid UTF-8 as U+FFFD; these bytes keep it."
+                    ),
+                },
             },
             "required": ["drawer_id"],
         },

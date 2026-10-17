@@ -48,7 +48,9 @@ from urllib import parse as urlparse
 
 import numpy as np
 
+from ..lexical import bm25_scores
 from ..stored_text import decode_record, decode_value, encode_filter, prepare_stored_write
+from ._filters import matches_where, matches_where_document, validate_where
 from ._remote_common import (
     RemoteMarkerMixin,
     as_vector_array,
@@ -73,6 +75,7 @@ from .base import (
     UnsupportedCapabilityError,
     UnsupportedFilterError,
     _IncludeSpec,
+    validate_write_batch,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,7 +97,6 @@ class _ConnectionLost(Exception):
 _DEFAULT_DSN = "postgresql://localhost:5432/mempalace"
 _MARKER_FILENAME = "pgvector_backend.json"
 _MAX_IDENTIFIER = 63  # Postgres identifier byte limit.
-_TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
 # Shared-namespace normalization (see _shared_namespace_slug): separators that
 # fold to "_", and the character set the result must then consist of.
 _SHARED_NAMESPACE_SEPARATOR_RE = re.compile(r"[\s\-./:_]+")
@@ -102,9 +104,6 @@ _SHARED_NAMESPACE_RE = re.compile(r"^[a-z0-9_]*[a-z0-9][a-z0-9_]*$")
 # Operators that translate to a JSONB containment predicate and so can be
 # pushed down to SQL. Comparisons, $or and $contains stay on the local exact
 # path (Python filtering), mirroring the Qdrant backend's local fallback.
-_SUPPORTED_OPERATORS = frozenset(
-    {"$eq", "$ne", "$in", "$nin", "$and", "$or", "$contains", "$gt", "$gte", "$lt", "$lte"}
-)
 _PUSHDOWN_OPERATORS = frozenset({"$eq", "$ne", "$in", "$nin", "$and"})
 # Bounds for the local-post-filter branch of ``get_recent``. The pushdown
 # branch needs none — SQL does ORDER BY ... LIMIT n and returns exactly n
@@ -124,146 +123,6 @@ def _utcnow() -> str:
 
 def _json_dumps(obj: Any) -> str:
     return json.dumps(obj or {}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-
-def _tokenize(text: str) -> list[str]:
-    if not text:
-        return []
-    return _TOKEN_RE.findall(text.lower())
-
-
-def _bm25_scores(query: str, documents: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
-    query_terms = set(_tokenize(query))
-    n_docs = len(documents)
-    if not query_terms or n_docs == 0:
-        return [0.0] * n_docs
-
-    tokenized = [_tokenize(d) for d in documents]
-    doc_lens = [len(toks) for toks in tokenized]
-    if not any(doc_lens):
-        return [0.0] * n_docs
-    avgdl = sum(doc_lens) / n_docs or 1.0
-
-    df = {term: 0 for term in query_terms}
-    for toks in tokenized:
-        for term in set(toks) & query_terms:
-            df[term] += 1
-
-    idf = {term: np.log((n_docs - df[term] + 0.5) / (df[term] + 0.5) + 1.0) for term in query_terms}
-    scores = []
-    for toks, dl in zip(tokenized, doc_lens):
-        if dl == 0:
-            scores.append(0.0)
-            continue
-        tf: dict[str, int] = {}
-        for token in toks:
-            if token in query_terms:
-                tf[token] = tf.get(token, 0) + 1
-        score = 0.0
-        for term, freq in tf.items():
-            num = freq * (k1 + 1)
-            den = freq + k1 * (1 - b + b * dl / avgdl)
-            score += float(idf[term]) * num / den
-        scores.append(score)
-    return scores
-
-
-def _validate_where(where: Optional[dict]) -> None:
-    if not where:
-        return
-    stack = [where]
-    while stack:
-        node = stack.pop()
-        if not isinstance(node, dict):
-            continue
-        for key, value in node.items():
-            if key.startswith("$") and key not in _SUPPORTED_OPERATORS:
-                raise UnsupportedFilterError(f"operator {key!r} not supported by pgvector")
-            if isinstance(value, dict):
-                stack.append(value)
-            elif isinstance(value, list):
-                stack.extend(item for item in value if isinstance(item, dict))
-
-
-def _coerce_comparable(value: Any):
-    if isinstance(value, bool):
-        return int(value)
-    return value
-
-
-def _compare(actual: Any, op: str, expected: Any) -> bool:
-    actual = _coerce_comparable(actual)
-    expected = _coerce_comparable(expected)
-    if op == "$eq":
-        return actual == expected
-    if op == "$ne":
-        return actual != expected
-    if op == "$in":
-        return actual in (expected or [])
-    if op == "$nin":
-        return actual not in (expected or [])
-    if op == "$contains":
-        return str(expected) in str(actual or "")
-    try:
-        if op == "$gt":
-            return actual > expected
-        if op == "$gte":
-            return actual >= expected
-        if op == "$lt":
-            return actual < expected
-        if op == "$lte":
-            return actual <= expected
-    except TypeError:
-        return False
-    raise UnsupportedFilterError(f"operator {op!r} not supported by pgvector")
-
-
-def _matches_where(meta: dict, where: Optional[dict]) -> bool:
-    if not where:
-        return True
-    if not isinstance(where, dict):
-        return False
-    for key, expected in where.items():
-        if key == "$and":
-            if not all(_matches_where(meta, clause) for clause in expected or []):
-                return False
-            continue
-        if key == "$or":
-            if not any(_matches_where(meta, clause) for clause in expected or []):
-                return False
-            continue
-        if key.startswith("$"):
-            raise UnsupportedFilterError(f"operator {key!r} not supported by pgvector")
-        actual = meta.get(key)
-        if isinstance(expected, dict):
-            for op, operand in expected.items():
-                if not _compare(actual, op, operand):
-                    return False
-        elif actual != expected:
-            return False
-    return True
-
-
-def _matches_where_document(document: str, where_document: Optional[dict]) -> bool:
-    if not where_document:
-        return True
-    if not isinstance(where_document, dict):
-        return False
-    for key, value in where_document.items():
-        if key == "$contains":
-            if str(value) not in document:
-                return False
-            continue
-        if key == "$and":
-            if not all(_matches_where_document(document, clause) for clause in value or []):
-                return False
-            continue
-        if key == "$or":
-            if not any(_matches_where_document(document, clause) for clause in value or []):
-                return False
-            continue
-        raise UnsupportedFilterError(f"where_document operator {key!r} not supported")
-    return True
 
 
 def _requires_local_filter(where: Optional[dict], where_document: Optional[dict] = None) -> bool:
@@ -296,22 +155,6 @@ def _requires_local_filter(where: Optional[dict], where_document: Optional[dict]
             elif isinstance(value, list):
                 stack.extend(item for item in value if isinstance(item, dict))
     return False
-
-
-def _validate_write_batch(
-    *,
-    documents: list[str],
-    ids: list[str],
-    metadatas: Optional[list[dict]],
-    embeddings: Optional[list[list[float]]],
-) -> None:
-    n = len(ids)
-    if len(documents) != n:
-        raise ValueError(f"documents length {len(documents)} does not match ids length {n}")
-    if metadatas is not None and len(metadatas) != n:
-        raise ValueError(f"metadatas length {len(metadatas)} does not match ids length {n}")
-    if embeddings is not None and len(embeddings) != n:
-        raise ValueError(f"embeddings length {len(embeddings)} does not match ids length {n}")
 
 
 def _vector_distance(query: np.ndarray, vector: list[float] | None) -> Optional[float]:
@@ -844,7 +687,7 @@ class _PgVectorClient:
         # metadata (e.g. mempalace_status's wing/room tally). Keeps the
         # positional _row parser unchanged — document remains record[1] —
         # while avoiding O(n × document_size) bytes over the wire on remote
-        # pgvector deployments. Follow-up to #1840.
+        # pgvector deployments.
         cols = "id, document, metadata" if with_document else "id, NULL::text, metadata"
         if with_embedding:
             cols += ", embedding"
@@ -1100,21 +943,21 @@ class PgVectorCollection(BaseCollection):
         the SELECT replaces document with NULL, dropping the per-row payload
         to id + metadata for every caller of this method.
 
-        Filtered fetches still need the ``_matches_where`` post-filter for
+        Filtered fetches still need the ``matches_where`` post-filter for
         non-pushdown semantics (array/object values where ``metadata @> ...``
         is broader than the exact match the caller asked for — same
-        correctness contract as #1840's filtered ``get`` path). Since that
+        correctness contract as the filtered ``get`` path). Since that
         post-filter only reads ``metadata``, we keep the single-scroll +
         ``with_document=False`` fast path and just apply the filter locally
         on the metadata dicts before returning. This extends the wire-byte
         win to filtered callers as well.
         """
-        _validate_where(where)
+        validate_where(where)
         pushdown = None if _requires_local_filter(where) else where
         rows = self._scroll(where=pushdown, with_document=False)
         if where is None:
             return [row["metadata"] for row in rows]
-        return [row["metadata"] for row in rows if _matches_where(row["metadata"], where)]
+        return [row["metadata"] for row in rows if matches_where(row["metadata"], where)]
 
     def _rows(
         self,
@@ -1124,8 +967,8 @@ class PgVectorCollection(BaseCollection):
         where_document=None,
         with_embedding=False,
     ) -> list[dict]:
-        _validate_where(where)
-        _validate_where(where_document)
+        validate_where(where)
+        validate_where(where_document)
         # ``id`` is the primary key. Push it as ``id = ANY(%s)`` so add/update
         # do not read the rest of the table. A where that SQL cannot express
         # stays a local filter on that already-narrow result.
@@ -1134,27 +977,27 @@ class PgVectorCollection(BaseCollection):
         return [
             row
             for row in rows
-            if _matches_where(row["metadata"], where)
-            and _matches_where_document(row["document"], where_document)
+            if matches_where(row["metadata"], where)
+            and matches_where_document(row["document"], where_document)
         ]
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
-        _validate_write_batch(
-            documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings
+        validate_write_batch(
+            ids,
+            unique_ids=True,
+            documents=documents,
+            metadatas=metadatas,
+            embeddings=embeddings,
         )
         if embeddings is None:
             raise ValueError("pgvector requires explicit embeddings")
-        if len(set(ids)) != len(ids):
-            raise ValueError("add ids must be unique")
         existing = self.get(ids=list(ids), include=[])
         if existing.ids:
             raise ValueError(f"ids already exist in pgvector collection: {existing.ids}")
         self.upsert(documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
-        _validate_write_batch(
-            documents=documents, ids=ids, metadatas=metadatas, embeddings=embeddings
-        )
+        validate_write_batch(ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
         if embeddings is None:
             raise ValueError("pgvector requires explicit embeddings")
         vectors, dimension = normalize_vectors(embeddings, "pgvector")
@@ -1173,40 +1016,6 @@ class PgVectorCollection(BaseCollection):
         self._client.upsert_rows(self._table, rows)
         self._backend._write_marker(self._palace, self._config)
 
-    def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
-        if documents is None and metadatas is None and embeddings is None:
-            raise ValueError("update requires at least one of documents, metadatas, embeddings")
-        n = len(ids)
-        for label, value in (
-            ("documents", documents),
-            ("metadatas", metadatas),
-            ("embeddings", embeddings),
-        ):
-            if value is not None and len(value) != n:
-                raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
-        existing = self.get(ids=ids, include=["documents", "metadatas", "embeddings"])
-        by_id = {
-            rid: (existing.documents[i], existing.metadatas[i], existing.embeddings[i])
-            for i, rid in enumerate(existing.ids)
-            if existing.embeddings is not None
-        }
-        out_ids, out_docs, out_metas, out_embeddings = [], [], [], []
-        for idx, doc_id in enumerate(ids):
-            if doc_id not in by_id:
-                continue
-            prev_doc, prev_meta, prev_embedding = by_id[doc_id]
-            out_ids.append(doc_id)
-            out_docs.append(documents[idx] if documents is not None else prev_doc)
-            meta = dict(prev_meta or {})
-            if metadatas is not None:
-                meta.update(metadatas[idx] or {})
-            out_metas.append(meta)
-            out_embeddings.append(embeddings[idx] if embeddings is not None else prev_embedding)
-        if out_ids:
-            self.upsert(
-                documents=out_docs, ids=out_ids, metadatas=out_metas, embeddings=out_embeddings
-            )
-
     def _query_local_exact(
         self, *, query_embeddings, n_results, where, where_document, include
     ) -> QueryResult:
@@ -1216,8 +1025,8 @@ class PgVectorCollection(BaseCollection):
         rows = [
             row
             for row in rows
-            if _matches_where(row["metadata"], where)
-            and _matches_where_document(row["document"], where_document)
+            if matches_where(row["metadata"], where)
+            and matches_where_document(row["document"], where_document)
         ]
         outer_ids: list[list[str]] = []
         outer_docs: list[list[str]] = []
@@ -1265,8 +1074,8 @@ class PgVectorCollection(BaseCollection):
             raise ValueError("query requires query_embeddings")
         if not query_embeddings:
             raise ValueError("query input must be a non-empty list")
-        _validate_where(where)
-        _validate_where(where_document)
+        validate_where(where)
+        validate_where(where_document)
         if _requires_local_filter(where, where_document):
             return self._query_local_exact(
                 query_embeddings=query_embeddings,
@@ -1431,7 +1240,7 @@ class PgVectorCollection(BaseCollection):
                 if row["id"] in seen:
                     continue
                 seen.add(row["id"])
-                if _matches_where(row["metadata"], where):
+                if matches_where(row["metadata"], where):
                     matched.append(row)
                     if len(matched) >= target:
                         break
@@ -1444,7 +1253,7 @@ class PgVectorCollection(BaseCollection):
 
         The base implementation scans a window in storage order and sorts it
         locally, so on a collection larger than ``limit`` the genuinely newest
-        records can be missing from the window entirely (#1630). Postgres can
+        records can be missing from the window entirely. Postgres can
         do the whole thing: ``ORDER BY metadata->>'filed_at' DESC ... LIMIT n``
         picks the true top ``limit`` under that ordering at any table size,
         which is why this backend advertises ``supports_recency_order``.
@@ -1489,7 +1298,7 @@ class PgVectorCollection(BaseCollection):
         """
         if limit is not None and limit <= 0:
             return GetResult.empty()
-        _validate_where(where)
+        validate_where(where)
         spec = _IncludeSpec.resolve(include, default_distances=False)
         if _requires_local_filter(where):
             rows = self._scroll_recent_local(
@@ -1499,7 +1308,7 @@ class PgVectorCollection(BaseCollection):
                 with_embedding=spec.embeddings,
                 # The post-filter reads only ``metadata``, and this branch can
                 # scan far more rows than it returns, so project the document
-                # text out unless the caller actually asked for it (#1840's
+                # text out unless the caller actually asked for it (the filtered ``get`` path's
                 # wire-byte win). The pushdown branch below is left alone: it
                 # fetches ``limit`` rows, so the projection is worth little
                 # there and not worth changing that path's SQL for. (It would
@@ -1522,7 +1331,7 @@ class PgVectorCollection(BaseCollection):
         )
 
     def delete(self, *, ids=None, where=None):
-        _validate_where(where)
+        validate_where(where)
         if not self._table_exists():
             if self._marker_exists():
                 raise CollectionNotInitializedError(self._collection_name)
@@ -1555,8 +1364,8 @@ class PgVectorCollection(BaseCollection):
         # Validate the filter before the existence short-circuit so an
         # unsupported local-only filter raises even on an unmaterialized
         # collection — matches the order used by get()/lexical_search() and
-        # qdrant.facet_counts (PR #1868 review).
-        _validate_where(where)
+        # qdrant.facet_counts.
+        validate_where(where)
         if _requires_local_filter(where):
             raise UnsupportedCapabilityError("facet_counts does not support local-only filters")
         if not self._table_exists():
@@ -1566,11 +1375,11 @@ class PgVectorCollection(BaseCollection):
         return self._client.facet_counts(self._table, field=field, where=where, limit=limit)
 
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
-        _validate_where(where)
+        validate_where(where)
         pushdown = None if _requires_local_filter(where) else where
         rows = self._scroll(where=pushdown, with_embedding=False)
-        rows = [row for row in rows if _matches_where(row["metadata"], where)]
-        scores = _bm25_scores(query, [row["document"] for row in rows])
+        rows = [row for row in rows if matches_where(row["metadata"], where)]
+        scores = bm25_scores(query, [row["document"] for row in rows])
         hits = [
             LexicalHit(
                 id=row["id"],

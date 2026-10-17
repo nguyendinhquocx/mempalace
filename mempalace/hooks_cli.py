@@ -13,21 +13,22 @@ with ``cwd`` on every record, and passes that file's path here.
 """
 
 import hashlib
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from mempalace._proc import pid_alive as _pid_alive
 from mempalace.config import MempalaceConfig
+from mempalace.fsio import decode_source
 from mempalace.write_routing import (
     ResolvedWriteRoutingPolicy,
     WriteRoutingDecision,
@@ -46,7 +47,7 @@ def _detached_popen_kwargs() -> dict:
 
     Without these, Windows holds the parent open until the child closes the
     inherited stdout/stderr handles — manifesting as "Stop hook hangs" at
-    session end (#1268). On POSIX the parent can already exit (orphan
+    session end. On POSIX the parent can already exit (orphan
     reparents to init), but ``start_new_session`` makes the boundary
     explicit so signals to the hook don't propagate to the background mine.
     """
@@ -63,7 +64,7 @@ def _detached_popen_kwargs() -> dict:
 
 
 def _config_root() -> Path:
-    """The directory this install keeps its config in (XDG-aware since #148)."""
+    """The directory this install keeps its config in (XDG-aware)."""
     from .config import _default_config_dir
 
     return _default_config_dir()
@@ -77,7 +78,7 @@ def _palace_root_exists() -> bool:
     creation, mining, ingestion) must respect this and short-circuit BEFORE
     touching disk — including before logging the short-circuit itself.
 
-    Since #148 a fresh install keeps its config and palace in the XDG config
+    A fresh install keeps its config and palace in the XDG config
     directory (``~/.config/mempalace`` by default) and never creates
     ``~/.mempalace``, so checking only the legacy path silently disabled every
     hook on new installs. The legacy directory still passes on its own, which
@@ -120,8 +121,7 @@ def _mempalace_python() -> str:
     # ``/work``, ``/opt/app``, or other minimal-prefix installs don't have 4
     # (or sometimes even 2) parent directories. Use ``len(parents)`` to
     # check the depth before indexing; LBYL is the standard Python idiom
-    # for bounded-integer lookups. Per PR #1580 review (gemini-code-assist,
-    # medium priority).
+    # for bounded-integer lookups.
     parents = Path(__file__).resolve().parents
     if len(parents) > 3:
         venv_bin = parents[3] / "bin" / "python"
@@ -135,19 +135,31 @@ def _mempalace_python() -> str:
     return sys.executable
 
 
+# The children start in the user's project directory, which may be untrusted.
+# ``python -m`` would put that directory first on sys.path, so a project holding
+# mempalace/ or mempalace.py would run instead of the installed package. This
+# launcher drops the empty sys.path entry ``-c`` adds, leaving the working
+# directory itself (and every relative path) unchanged. Python 3.11+ honours
+# PYTHONSAFEPATH, which the hook wrappers export, and adds no entry at all.
+_SAFE_MAIN = (
+    "import sys\n"
+    "if sys.path and sys.path[0] == '': del sys.path[0]\n"
+    "import runpy\n"
+    "runpy.run_module('mempalace', run_name='__main__', alter_sys=True)\n"
+)
+
+
+def _mempalace_command(*args: str) -> list:
+    """Command line that runs ``mempalace <args>`` without importing from the cwd."""
+    return [_mempalace_python(), "-c", _SAFE_MAIN, *args]
+
+
 _RECENT_MSG_COUNT = 30  # how many recent user messages to summarize
 
 STOP_BLOCK_REASON = (
     "MemPalace auto-save checkpoint. "
     "Use mempalace_diary_write (session summary) and mempalace_add_drawer "
     "(quotes, decisions, code) to save session content. "
-    "Do NOT use native auto-memory files."
-)
-
-PRECOMPACT_BLOCK_REASON = (
-    "MemPalace emergency save — compaction imminent. "
-    "Use mempalace_diary_write (thorough summary) and mempalace_add_drawer "
-    "(ALL quotes, decisions, code, context) to save ALL content before context is lost. "
     "Do NOT use native auto-memory files."
 )
 
@@ -205,8 +217,8 @@ def _count_human_messages(transcript_path: str) -> int:
                             if "<command-message>" in text:
                                 continue
                         count += 1
-                    # Also handle Codex CLI transcript format
-                    # {"type": "event_msg", "payload": {"type": "user_message", "message": "..."}}
+                    # Codex CLI transcripts nest a user turn as an event_msg
+                    # whose payload has type user_message and a message field.
                     elif entry.get("type") == "event_msg":
                         payload = entry.get("payload", {})
                         if isinstance(payload, dict) and payload.get("type") == "user_message":
@@ -288,7 +300,7 @@ def _get_mine_targets() -> list[tuple[str, str]]:
     MEMPAL_DIR (when set and resolvable) contributes a ``"projects"``
     target. Transcript ingestion is handled separately by
     ``_ingest_transcript`` — emitting it here too would double-mine the
-    same JSONL into a different wing on every hook fire (#1231 review).
+    same JSONL into a different wing on every hook fire.
 
     An empty list means no MEMPAL_DIR ingest should run.
     """
@@ -306,8 +318,8 @@ def _get_mine_targets() -> list[tuple[str, str]]:
 # Hook fires ingest mines in the background. If a previous fire's child is
 # still running for the *same* target (same source dir, mode, wing), the new
 # fire should skip rather than pile up — multiple concurrent mines against the
-# same source corrupt the HNSW index and exhaust disk via duplicate upserts
-# (#1212, #1206). But mines targeting *different* sources / modes must remain
+# same source corrupt the HNSW index and exhaust disk via duplicate upserts.
+# But mines targeting *different* sources / modes must remain
 # independent so the user can have e.g. project-mining and transcript-ingest
 # running in parallel.
 #
@@ -327,7 +339,7 @@ _MINE_PID_FILE_ENV = "MEMPALACE_MINE_PID_FILE"
 # Maximum wall-clock hours a mine subprocess is allowed to run before its
 # PID slot is treated as stale (even if the process is still alive).  A
 # wedged mine — e.g. one that is blocking indefinitely on ChromaDB
-# cold-init under concurrent Windows load (#1552) — would otherwise hold
+# cold-init under concurrent Windows load — would otherwise hold
 # its slot forever.  Set MEMPALACE_MINE_TIMEOUT_HOURS=0 to disable the
 # timeout (slots are reclaimed only when the PID is dead).
 _MINE_TIMEOUT_HOURS_ENV = "MEMPALACE_MINE_TIMEOUT_HOURS"
@@ -370,8 +382,8 @@ def _pid_file_for_cmd(cmd: list[str]) -> Path:
 def _mine_already_running(cmd: list[str]) -> bool:
     """Return True if a previous mine for ``cmd``'s target is still alive.
 
-    The PID file format is ``{pid} {unix_timestamp}`` (timestamp added in
-    #1552 to detect wedged subprocesses).  Old-format files (bare ``{pid}``)
+    The PID file format is ``{pid} {unix_timestamp}`` (the timestamp detects
+    wedged subprocesses).  Old-format files (bare ``{pid}``)
     use the PID file's mtime as the approximate start time so a still-running
     pre-upgrade mine is not immediately misclassified as stale.
 
@@ -415,7 +427,7 @@ def _create_mine_slot_with_placeholder(pid_file: Path) -> Path:
 
     The slot body is ``{pid} {unix_timestamp}`` so that stale-by-age
     detection in ``_mine_already_running`` can determine how long the
-    recorded process has been running (#1552).
+    recorded process has been running.
     """
     fd = os.open(str(pid_file), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
@@ -514,18 +526,6 @@ def _spawn_mine(cmd: list) -> bool:
     except OSError:
         pass
     return True
-
-
-def _hooks_daemon_enabled() -> bool:
-    """Legacy compatibility helper for the pre-policy hook setting.
-
-    New hook write paths use ``resolve_write_routing("hooks")``. This
-    helper remains for callers/tests that still inspect ``hooks.daemon``.
-    """
-    try:
-        return MempalaceConfig().hook_use_daemon is True
-    except Exception:
-        return False
 
 
 def _daemon_mine_dedupe_key(source: str, mode: str) -> str:
@@ -720,7 +720,7 @@ def _submit_daemon_job(
         wait=wait,
         auto_start=False,
         timeout=timeout,
-        # A job refused the palace lock is deferred, not failed (#2014), so it
+        # A job refused the palace lock is deferred, not failed, so it
         # is never terminal while the holder lives. The waiting callers below
         # wait on purpose, but a parked job cannot reach the state they wait
         # for: they would burn the whole timeout and then report a failure that
@@ -753,7 +753,7 @@ def _maybe_auto_ingest():
     Transcript convos are ingested separately via ``_ingest_transcript``
     in the hook handlers — this function does not handle them, to avoid
     asymmetric interpreter handling and PID-file overwrite when both
-    targets fire from a single hook call (#1231 review).
+    targets fire from a single hook call.
 
     Per-target dedup is done by ``_spawn_mine`` itself: each (dir, mode)
     target gets its own PID slot, so distinct targets never block each
@@ -783,7 +783,7 @@ def _maybe_auto_ingest():
                     # Daemon accepted context — don't fall back (would double-mine).
                     _log(f"Daemon mine submission failed: {exc}")
                 continue
-            _spawn_mine([_mempalace_python(), "-m", "mempalace", "mine", mine_dir, "--mode", mode])
+            _spawn_mine(_mempalace_command("mine", mine_dir, "--mode", mode))
         except OSError:
             pass
         except Exception as exc:
@@ -798,7 +798,7 @@ def _mine_sync():
 
     Transcript convos are ingested separately via ``_ingest_transcript``
     in ``hook_precompact`` — keeping them out of this function avoids
-    timeout stacking against the harness 30s ceiling (#1231 review).
+    timeout stacking against the harness 30s ceiling.
     """
     targets = _get_mine_targets()
     if not targets:
@@ -826,7 +826,7 @@ def _mine_sync():
                     if _job_deferred_by_lock(job):
                         # Parked behind the palace lock, not failed: the daemon
                         # runs it once the holder exits. Saying "failed" here
-                        # would be the false report #2014 is about.
+                        # would be a false report.
                         _log(f"Daemon sync mine deferred: {_lock_deferral_reason(job)}")
                     elif job.get("state") != "succeeded" or not result.get("success", True):
                         _log(f"Daemon sync mine failed: {result.get('error', job.get('error'))}")
@@ -836,15 +836,7 @@ def _mine_sync():
                 continue
             with open(log_path, "a") as log_f:
                 subprocess.run(
-                    [
-                        _mempalace_python(),
-                        "-m",
-                        "mempalace",
-                        "mine",
-                        mine_dir,
-                        "--mode",
-                        mode,
-                    ],
+                    _mempalace_command("mine", mine_dir, "--mode", mode),
                     stdout=log_f,
                     stderr=log_f,
                     timeout=60,
@@ -932,10 +924,10 @@ def _extract_recent_messages(transcript_path: str, count: int = _RECENT_MSG_COUN
         return []
     messages = []
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
+        with open(path, "rb") as f:
+            for raw_line in f:
                 try:
-                    entry = json.loads(line)
+                    entry = json.loads(decode_source(raw_line)[0])
                     # Claude Code format
                     msg = entry.get("message") or entry.get("event_message") or {}
                     if isinstance(msg, dict) and msg.get("role") == "user":
@@ -1125,7 +1117,7 @@ def _save_diary_direct(
     project mines, so the caller must not start them itself.
 
     The entry is filed under `agent_name` so the agent that later calls
-    `mempalace_diary_read(agent_name=...)` discovers it (#1693). If `wing` is
+    `mempalace_diary_read(agent_name=...)` discovers it. If `wing` is
     set, the entry lands in that wing (typically the project wing derived from
     the transcript path); a `diary_read` with an empty wing spans every wing
     the agent wrote to, so project-derived wings stay discoverable.
@@ -1137,7 +1129,7 @@ def _save_diary_direct(
 
     drawers_filed is the number of palace drawers (memory entries) filed by this
     call. One checkpoint write files exactly ONE drawer -- never N. That is the
-    distinction #2303 is about: the legacy return conflated "memories stored"
+    distinction that matters: the legacy return conflated "memories stored"
     (drawers) with the transcript-message count compressed into that single
     drawer, which is now reported separately as messages_folded. The render path
     must label each unit correctly.
@@ -1282,19 +1274,7 @@ def _ingest_transcript(transcript_path: str):
         # Route through ``_spawn_mine`` so the per-target PID guard kicks
         # in here too — repeated Stop/PreCompact fires for the same
         # transcript should not stack up parallel ingest mines.
-        _spawn_mine(
-            [
-                _mempalace_python(),
-                "-m",
-                "mempalace",
-                "mine",
-                str(path),
-                "--mode",
-                "convos",
-                "--wing",
-                wing,
-            ]
-        )
+        _spawn_mine(_mempalace_command("mine", str(path), "--mode", "convos", "--wing", wing))
         _log(f"Transcript ingest started: {path.name} -> {wing}")
     except OSError:
         pass
@@ -1314,7 +1294,7 @@ def _diary_agent_for_harness(harness: str) -> str:
     Stop-hook checkpoints must be filed beside the agent's own entries so
     ``mempalace_diary_read(agent_name=...)`` surfaces them. The old code filed
     them under a fixed ``"session-hook"`` identity that no reader ever queried,
-    hiding every checkpoint (#1693). A ``claude-code`` session reads its diary
+    hiding every checkpoint. A ``claude-code`` session reads its diary
     as ``"claude"``; every other harness already reads under its own name, so
     returning the harness name keeps a newly supported harness discoverable
     instead of silently invisible again.
@@ -1477,8 +1457,6 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
        transcripts not under the standard Claude Code projects dir.
 
     4. DEFAULT — ``wing_sessions``.
-
-    Closes #1410.
     """
     # 1. Primary — cwd from JSONL is the canonical source of truth
     cwd_wing = _wing_from_jsonl_cwd(transcript_path)
@@ -1608,7 +1586,7 @@ def hook_stop(data: dict, harness: str):
                         _ingest_transcript(transcript_path)
                     _maybe_auto_ingest()
                 # Only advance the save marker after a genuine drawer was filed
-                # (#2303): the legacy "count" was the compressed-message count and
+                #: the legacy "count" was the compressed-message count and
                 # was misread as a storage count. Report each unit truthfully. A
                 # queued checkpoint's child advances the marker once it has filed.
                 drawers_filed = result.get("drawers_filed", 0)
@@ -1694,7 +1672,7 @@ def _clear_session_last_save(session_id: str) -> None:
 def hook_session_end(data: dict, harness: str):
     """Session end hook: one final flush when a session exits cleanly.
 
-    Closes the gap (#1341) where a session that never crosses ``SAVE_INTERVAL``
+    Closes the gap where a session that never crosses ``SAVE_INTERVAL``
     on ``Stop`` and never triggers ``PreCompact`` exits with nothing saved —
     the common case for short, useful sessions.
 

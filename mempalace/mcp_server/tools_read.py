@@ -7,7 +7,7 @@ if __name__ != "mempalace.mcp_server":
 
 
 def _tool_status_via_sqlite() -> dict:
-    """Pure-sqlite status reader for the #1222 fallback path.
+    """Pure-sqlite status reader for the diverged-HNSW fallback path.
 
     When the HNSW capacity probe detects divergence, opening the chromadb
     persistent client can segfault. This reader pulls the same wing/room
@@ -18,6 +18,7 @@ def _tool_status_via_sqlite() -> dict:
     import sqlite3 as _sqlite3
 
     from ..backends._inproc_sqlite import open_reader as open_palace_reader
+    from ..backends.chroma import not_bookkeeping_sql
 
     db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
     if not os.path.isfile(db_path):
@@ -30,20 +31,21 @@ def _tool_status_via_sqlite() -> dict:
     try:
         conn = open_palace_reader(db_path)
         try:
+            drawers_only = not_bookkeeping_sql(conn)
             row = conn.execute(
-                """
+                f"""
                 SELECT COUNT(*)
                 FROM embeddings e
                 JOIN segments s ON e.segment_id = s.id
                 JOIN collections c ON s.collection = c.id
-                WHERE c.name = ?
+                WHERE c.name = ? AND {drawers_only}
                 """,
                 (collection_name,),
             ).fetchone()
             total = int(row[0]) if row and row[0] is not None else 0
             for key, target in (("wing", wings), ("room", rooms)):
                 for value, count in conn.execute(
-                    """
+                    f"""
                     SELECT em.string_value, COUNT(*)
                     FROM embedding_metadata em
                     JOIN embeddings e ON em.id = e.id
@@ -52,6 +54,7 @@ def _tool_status_via_sqlite() -> dict:
                     WHERE c.name = ?
                       AND em.key = ?
                       AND em.string_value IS NOT NULL
+                      AND {drawers_only}
                     GROUP BY em.string_value
                     """,
                     (collection_name, key),
@@ -82,7 +85,7 @@ def _tool_status_via_sqlite() -> dict:
 
 
 def _sqlite_taxonomy():
-    """Fast wing→room tally from the backend's sqlite metadata (#1748 / #1379).
+    """Fast wing→room tally from the backend's sqlite metadata.
 
     Returns ``(total, {wing: {room: count}})`` or ``None`` to signal the
     caller to fall back to the collection pagination path. ``None`` means
@@ -153,8 +156,7 @@ def _sqlite_taxonomy():
 
 
 def _sqlite_graph_stats():
-    """Compute ``graph_stats`` from one grouped sqlite read (#1379, graph_stats
-    half; follow-up to #1748).
+    """Compute ``graph_stats`` from one grouped sqlite read.
 
     ``graph_stats`` only needs grouped counts, but the client path builds the
     whole graph by paging every metadata row (``build_graph`` →
@@ -282,6 +284,72 @@ def _chroma_room_wing_hall_counts():
     return rows
 
 
+def _bookkeeping_taxonomy(col) -> dict:
+    """``{wing: {room: n}}`` of the registry rows and sentinels, to subtract
+    from facet counts. One metadata-only read; empty when it fails."""
+    try:
+        got = col.get(where=BOOKKEEPING_WHERE, include=["metadatas"])
+        metas = got.get("metadatas") if hasattr(got, "get") else None
+    except Exception:
+        logger.debug("bookkeeping row read failed", exc_info=True)
+        metas = None
+    taxonomy: dict = {}
+    for m in metas if isinstance(metas, list) else []:
+        m = m or {}
+        if is_bookkeeping(m):
+            dest = taxonomy.setdefault(m.get("wing", "unknown"), {})
+            room = m.get("room", "unknown")
+            dest[room] = dest.get(room, 0) + 1
+    return taxonomy
+
+
+def _subtract_counts(counts: dict, key, n: int) -> None:
+    left = counts.get(key, 0) - n
+    if left > 0:
+        counts[key] = left
+    else:
+        counts.pop(key, None)
+
+
+def _drop_bookkeeping_facets(col, wings=None, rooms=None, taxonomy=None, wing=None) -> int:
+    """Take registry rows and sentinels out of facet tallies; return how many."""
+    dropped = 0
+    for w, room_counts in _bookkeeping_taxonomy(col).items():
+        if wing is not None and w != wing:
+            continue
+        for r, n in room_counts.items():
+            dropped += n
+            if wings is not None:
+                _subtract_counts(wings, w, n)
+            if rooms is not None:
+                _subtract_counts(rooms, r, n)
+            if taxonomy is not None and w in taxonomy:
+                _subtract_counts(taxonomy[w], r, n)
+                if not taxonomy[w]:
+                    del taxonomy[w]
+    return dropped
+
+
+def _tally_wings_rooms(all_meta, wings=None, rooms=None, taxonomy=None) -> int:
+    """Count drawers by wing and room, leaving out bookkeeping rows."""
+    total = 0
+    for m in all_meta:
+        m = m or {}
+        if is_bookkeeping(m):
+            continue
+        total += 1
+        w = m.get("wing", "unknown")
+        r = m.get("room", "unknown")
+        if wings is not None:
+            wings[w] = wings.get(w, 0) + 1
+        if rooms is not None:
+            rooms[r] = rooms.get(r, 0) + 1
+        if taxonomy is not None:
+            dest = taxonomy.setdefault(w, {})
+            dest[r] = dest.get(r, 0) + 1
+    return total
+
+
 def tool_status():
     _ensure_sqlite_integrity_status()
     if _sqlite_integrity_errors:
@@ -293,8 +361,8 @@ def tool_status():
             result["partial"] = True
         return result
 
-    # Run the safe sqlite/pickle probe before we touch chromadb. In the
-    # #1222 failure mode, opening the persistent client to call .count()
+    # Run the safe sqlite/pickle probe before we touch chromadb. With a
+    # diverged HNSW index, opening the persistent client to call .count()
     # can segfault — short-circuit to a pure-sqlite path when divergence
     # is detected so status stays reachable.
     db_exists = _backend_db_exists()
@@ -305,7 +373,7 @@ def tool_status():
 
     # Fast path: tally wing/room straight from sqlite so overview tools stay
     # responsive on large palaces instead of cold-loading the HNSW index or
-    # paging hundreds of MB of metadata through the client (#1748 / #1379).
+    # paging hundreds of MB of metadata through the client.
     # ``None`` (non-chroma backend / non-standard layout) falls through to the
     # client path below.
     fast = _sqlite_taxonomy()
@@ -329,7 +397,7 @@ def tool_status():
 
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
-    # accidentally creating a palace in a non-existent directory (#830).
+    # accidentally creating a palace in a non-existent directory.
     col = _get_collection(create=db_exists)
     if not col:
         return _collection_error_or_no_palace()
@@ -365,6 +433,7 @@ def tool_status():
                         rooms["unknown"] = rooms.get("unknown", 0) + unknown_rooms
                 except (TypeError, ValueError):
                     pass
+                result["total_drawers"] = count - _drop_bookkeeping_facets(col, wings, rooms)
 
             except Exception as e:
                 logger.warning(
@@ -372,21 +441,11 @@ def tool_status():
                 )
                 rooms.clear()
                 wings.clear()
-                all_meta = _get_cached_metadata(col)
-                for m in all_meta:
-                    m = m or {}
-                    w = m.get("wing", "unknown")
-                    r = m.get("room", "unknown")
-                    wings[w] = wings.get(w, 0) + 1
-                    rooms[r] = rooms.get(r, 0) + 1
+                result["total_drawers"] = _tally_wings_rooms(
+                    _get_cached_metadata(col), wings, rooms
+                )
         else:
-            all_meta = _get_cached_metadata(col)
-            for m in all_meta:
-                m = m or {}
-                w = m.get("wing", "unknown")
-                r = m.get("room", "unknown")
-                wings[w] = wings.get(w, 0) + 1
-                rooms[r] = rooms.get(r, 0) + 1
+            result["total_drawers"] = _tally_wings_rooms(_get_cached_metadata(col), wings, rooms)
     except Exception as e:
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
@@ -452,17 +511,14 @@ def tool_list_wings():
                     wings["unknown"] = wings.get("unknown", 0) + unknown_wings
             except (TypeError, ValueError):
                 pass
+            _drop_bookkeeping_facets(col, wings=wings)
         except Exception as e:
             if _supports_metadata_facets(col):
                 logger.warning(
                     "Failed to fetch metadata facets, falling back to client-side loop: %s", e
                 )
             wings.clear()
-            all_meta = _get_cached_metadata(col)
-            for m in all_meta:
-                m = m or {}
-                w = m.get("wing", "unknown")
-                wings[w] = wings.get(w, 0) + 1
+            _tally_wings_rooms(_get_cached_metadata(col), wings=wings)
     except Exception as e:
         logger.exception("tool_list_wings metadata fetch failed")
         result["error"] = str(e)
@@ -507,17 +563,14 @@ def tool_list_rooms(wing: str = None):
                     rooms["unknown"] = rooms.get("unknown", 0) + unknown_rooms
             except (TypeError, ValueError):
                 pass
+            _drop_bookkeeping_facets(col, rooms=rooms, wing=wing)
         except Exception as e:
             if _supports_metadata_facets(col):
                 logger.warning(
                     "Failed to fetch metadata facets, falling back to client-side loop: %s", e
                 )
             rooms.clear()
-            all_meta = _fetch_all_metadata(col, where=where)
-            for m in all_meta:
-                m = m or {}
-                r = m.get("room", "unknown")
-                rooms[r] = rooms.get(r, 0) + 1
+            _tally_wings_rooms(_fetch_all_metadata(col, where=where), rooms=rooms)
     except Exception as e:
         logger.exception("tool_list_rooms metadata fetch failed")
         result["error"] = str(e)
@@ -559,19 +612,13 @@ def tool_get_taxonomy():
                         pass
                     temp_taxonomy[wing] = room_counts
                 taxonomy.update(temp_taxonomy)
+            _drop_bookkeeping_facets(col, taxonomy=taxonomy)
         except Exception as e:
             if _supports_metadata_facets(col):
                 logger.warning(
                     "Failed to fetch metadata facets, falling back to client-side loop: %s", e
                 )
-            all_meta = _get_cached_metadata(col)
-            for m in all_meta:
-                m = m or {}
-                w = m.get("wing", "unknown")
-                r = m.get("room", "unknown")
-                if w not in taxonomy:
-                    taxonomy[w] = {}
-                taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
+            _tally_wings_rooms(_get_cached_metadata(col), taxonomy=taxonomy)
     except Exception as e:
         logger.exception("tool_get_taxonomy metadata fetch failed")
         result["error"] = str(e)
@@ -608,16 +655,8 @@ def tool_search(
     except ValueError as e:
         return {"error": str(e)}
     # since/before are validated inside search_memories (shared
-    # parse_window), which returns the same {"error": ...} shape.
-    candidate_strategy = candidate_strategy or "vector"
-    if not isinstance(candidate_strategy, str) or candidate_strategy not in {"vector", "union"}:
-        return {"error": "candidate_strategy must be one of ('vector', 'union')"}
-    if (
-        not isinstance(include_media, bool)
-        or not isinstance(query_task, str)
-        or query_task not in {"search", "code"}
-    ):
-        return {"error": "include_media must be boolean and query_task must be 'search' or 'code'"}
+    # parse_window), which returns the same {"error": ...} shape. Argument
+    # types and enums are checked against the schema at dispatch.
     if cli_compatible and (include_media or query_task != "search"):
         return {"error": "cli_compatible cannot be combined with media/code task search"}
     experimental = {
@@ -628,7 +667,7 @@ def tool_search(
         )
         if value != default
     }
-    # Mitigate system prompt contamination (Issue #333)
+    # Mitigate system prompt contamination.
     sanitized = sanitize_query(query)
     if cli_compatible:
         import contextlib
@@ -706,7 +745,7 @@ def tool_search(
     # Ensure the vector-disabled probe has been run via the safe
     # sqlite/pickle path before we touch chromadb. Calling _get_client()
     # here would defeat the fallback — it constructs a PersistentClient
-    # which can segfault on segment load in the #1222 failure mode.
+    # which can segfault on segment load when the HNSW index has diverged.
     _refresh_vector_disabled_flag()
     result = search_memories(
         sanitized["clean_query"],
@@ -724,7 +763,7 @@ def tool_search(
         **experimental,
     )
     if _is_transient_index_error(result):
-        # Post-bulk-write HNSW flush window (#1315): drop caches, give
+        # Post-bulk-write HNSW flush window: drop caches, give
         # the segment a moment to settle, retry once. Caller never sees
         # the transient unless the second attempt also fails.
         _force_chroma_cache_reset()
@@ -751,14 +790,10 @@ def tool_search(
         result["vector_disabled"] = True
         result["vector_disabled_reason"] = _vector_disabled_reason
     # Attach sanitizer metadata for transparency
-    if sanitized["was_sanitized"]:
+    report = sanitizer_report(sanitized)
+    if report:
         result["query_sanitized"] = True
-        result["sanitizer"] = {
-            "method": sanitized["method"],
-            "original_length": sanitized["original_length"],
-            "clean_length": sanitized["clean_length"],
-            "clean_query": sanitized["clean_query"],
-        }
+        result["sanitizer"] = report
     if context:
         result["context_received"] = True
     return result
@@ -831,14 +866,17 @@ def tool_traverse_graph(start_room: str, max_hops: int = 2):
     """Walk the palace graph from a room. Find connected ideas across wings."""
     max_hops = max(1, min(max_hops, 10))
     # sqlite metadata path does not open HNSW. When it cannot serve, open the
-    # collection here so a missing/broken palace still reports why (#1379
-    # follow-up) instead of looking like a palace with no such room.
+    # collection here so a missing/broken palace still reports why instead
+    # of looking like a palace with no such room.
     if _graph_sqlite_reader() is None:
         col = _get_collection()
         if not col:
             return _collection_error_or_no_palace()
         return traverse(start_room, col=col, max_hops=max_hops)
-    return traverse(start_room, max_hops=max_hops, config=_config)
+    try:
+        return traverse(start_room, max_hops=max_hops, config=_config)
+    except GraphUnavailable as e:
+        return {"error": str(e)}
 
 
 def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
@@ -853,14 +891,17 @@ def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
         if not col:
             return _collection_error_or_no_palace()
         return find_tunnels(wing_a, wing_b, col=col)
-    return find_tunnels(wing_a, wing_b, config=_config)
+    try:
+        return find_tunnels(wing_a, wing_b, config=_config)
+    except GraphUnavailable as e:
+        return {"error": str(e)}
 
 
 def tool_graph_stats():
     """Palace graph overview: nodes, tunnels, edges, connectivity."""
     # Fast path: grouped sqlite read instead of paging all metadata and
-    # cold-loading HNSW via build_graph(), which times out on large palaces
-    # (#1379). Falls through to the client path for non-chroma backends.
+    # cold-loading HNSW via build_graph(), which times out on large palaces.
+    # Falls through to the client path for non-chroma backends.
     fast = _sqlite_graph_stats()
     if fast is not None:
         return fast
@@ -897,7 +938,7 @@ def tool_create_tunnel(
     # missing endpoints (empty/non-string names, and create_tunnel's
     # room-existence checks). Catch both so the real reason is surfaced
     # instead of escaping and being wrapped as the opaque "Internal tool
-    # error" (#1473), mirroring sibling tools.
+    # error", mirroring sibling tools.
     try:
         source_wing = sanitize_name(source_wing, "source_wing")
         source_room = sanitize_name(source_room, "source_room")
@@ -912,7 +953,7 @@ def tool_create_tunnel(
             source_drawer_id=source_drawer_id,
             target_drawer_id=target_drawer_id,
         )
-    except ValueError as e:
+    except (ValueError, GraphUnavailable) as e:
         return {"error": str(e)}
 
 
@@ -943,11 +984,6 @@ def tool_list_hallways(wing: str = None, limit: int = 100, offset: int = 0):
         wing = _sanitize_optional_name(wing, "wing")
     except ValueError as e:
         return {"error": str(e)}
-    try:
-        limit = max(1, min(int(limit), 500))
-        offset = max(0, int(offset))
-    except (TypeError, ValueError):
-        return {"error": "limit and offset must be integers"}
     rows = sorted(list_hallways(wing), key=lambda h: -int(h.get("co_occurrence_count") or 0))
     page = rows[offset : offset + limit]
     return {

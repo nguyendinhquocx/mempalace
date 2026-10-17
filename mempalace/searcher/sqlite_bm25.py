@@ -122,7 +122,7 @@ def _bm25_only_via_sqlite(
 ) -> dict:
     """BM25-only search reading drawers directly from chroma.sqlite3.
 
-    Used when HNSW is diverged or unloadable (#1222). Bypasses chromadb's
+    Used when HNSW is diverged or unloadable. Bypasses chromadb's
     Python client entirely so a corrupt vector segment can't segfault the
     MCP server. Routes through chromadb's own FTS5 trigram index
     (``embedding_fulltext_search``) for candidate selection, then re-ranks
@@ -194,7 +194,7 @@ def _bm25_only_via_sqlite(
     try:
         # FTS5 MATCH expects whitespace-separated tokens. Drop tokens
         # shorter than 3 chars (trigram tokenizer can't match them).
-        tokens = [t for t in _tokenize(query) if len(t) >= 3]
+        tokens = [t for t in tokenize(query) if len(t) >= 3]
         candidate_ids: list[int] = []
         candidates_truncated = False
         use_recency_fallback = not tokens
@@ -319,6 +319,8 @@ def _bm25_only_via_sqlite(
     candidates = []
     for d in drawers.values():
         text, meta = decode_record(d["text"], d["metadata"])
+        if is_bookkeeping(meta, d["_stored_drawer_id"]):
+            continue
         if wing and meta.get("wing") != wing:
             continue
         if room and meta.get("room") != room:
@@ -353,7 +355,7 @@ def _bm25_only_via_sqlite(
 
     # Local BM25 over the candidate set.
     docs = [c["text"] for c in candidates]
-    bm25_raw = _bm25_scores(query, docs, stop_words=stop_words)
+    bm25_raw = bm25_scores(query, docs, stop_words=stop_words)
     max_bm25 = max(bm25_raw) if bm25_raw else 0.0
     for c, raw in zip(candidates, bm25_raw):
         c["bm25_score"] = round(raw, 3)
@@ -445,6 +447,8 @@ def _merge_bm25_union_candidates(
     bm25_extra = []
     for hit in lexical.hits:
         meta = hit.metadata or {}
+        if is_bookkeeping(meta, hit.id):
+            continue
         # The window applies to every candidate source; a lexically strong
         # drawer outside [since, before) must not enter through this side
         # door (the vector-path candidates are filtered upstream).
@@ -476,7 +480,9 @@ def _merge_bm25_union_candidates(
                 None if distance is None else round(_distance_to_similarity(distance, metric), 3)
             ),
             "distance": distance,
-            "effective_distance": distance,
+            "effective_distance": (
+                None if distance is None else round(_cosine_scale_distance(distance, metric), 4)
+            ),
             "closet_boost": 0.0,
             "matched_via": "bm25_backend",
             "bm25_score": round(float(hit.score), 3),

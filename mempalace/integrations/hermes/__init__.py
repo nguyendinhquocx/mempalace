@@ -78,8 +78,9 @@ from mempalace.config import (
 )
 from mempalace.convo_miner import file_conversation_exchange
 from mempalace.knowledge_graph import KnowledgeGraph
-from mempalace.layers import Layer0
+from mempalace.layers import Layer0, fetch_recent_window, recent_read_failure
 from mempalace.palace import MineAlreadyRunning, get_collection
+from mempalace.query_sanitizer import sanitize_query, sanitizer_report
 from mempalace.searcher import search_memories
 
 # When this plugin is loaded by Hermes, ``agent.memory_provider`` is on the
@@ -112,28 +113,12 @@ def _l1_story_from_collection(
     from collections import defaultdict
     from pathlib import Path as _Path
 
-    docs: list = []
-    metas: list = []
-    batch = 500
-    offset = 0
-    max_scan = 2000
-    while True:
-        kwargs = {"include": ["documents", "metadatas"], "limit": batch, "offset": offset}
-        if wing:
-            kwargs["where"] = {"wing": wing}
-        try:
-            chunk = collection.get(**kwargs)
-        except Exception:
-            break
-        batch_docs = chunk.get("documents") or []
-        batch_metas = chunk.get("metadatas") or []
-        if not batch_docs:
-            break
-        docs.extend(batch_docs)
-        metas.extend(batch_metas)
-        offset += len(batch_docs)
-        if len(batch_docs) < batch or len(docs) >= max_scan:
-            break
+    try:
+        # Inline, no deadline: the caller holds _collection_lock for the whole
+        # read, and an abandoned reader thread would outlive it.
+        docs, metas = fetch_recent_window(collection, wing=wing or None, max_scan=2000, budget=None)
+    except Exception as exc:
+        return f"## L1 -- {recent_read_failure(exc)}"
 
     if not docs:
         return "## L1 -- No memories yet."
@@ -1380,8 +1365,9 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         if not query:
             return {"error": "Missing required parameter: query"}
         n = max(1, min(int(n_results or 5), 50))
+        sanitized = sanitize_query(query)
         data = search_memories(
-            query,
+            sanitized["clean_query"],
             palace_path=self._palace_path,
             wing=wing or "",
             room=room or "",
@@ -1390,7 +1376,12 @@ class MempalaceProvider(MemoryProvider):  # type: ignore[misc]
         if isinstance(data, dict) and "error" in data:
             return data
         hits = data.get("results", []) if isinstance(data, dict) else []
-        return {"results": hits, "count": len(hits)}
+        result = {"results": hits, "count": len(hits)}
+        report = sanitizer_report(sanitized)
+        if report:
+            result["query_sanitized"] = True
+            result["sanitizer"] = report
+        return result
 
     def _scan_metadatas(
         self, col: Any, where: Optional[Dict[str, Any]] = None

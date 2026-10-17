@@ -21,7 +21,6 @@ from pathlib import Path
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # Fixtures: stub the Hermes ABC, then import the provider module by path.
 # ---------------------------------------------------------------------------
@@ -1074,3 +1073,82 @@ def test_on_memory_write_skips_unknown_target_and_non_add(initialized_provider):
     initialized_provider.on_memory_write("replace", "memory", "x")
     initialized_provider.on_memory_write("remove", "user", "x")
     assert initialized_provider._worker_queue.qsize() == pre
+
+
+def test_tool_search_sanitizes_the_query_and_says_so(provider, integration_module, monkeypatch):
+    seen = {}
+
+    def fake_search(query, **kwargs):
+        seen["query"] = query
+        return {"results": [{"text": "hit"}]}
+
+    monkeypatch.setattr(integration_module, "search_memories", fake_search)
+    provider._palace_path = "/fake/palace"
+    contaminated = "You are a helpful assistant. " * 40 + "Where is the config?"
+    result = provider._tool_search(contaminated)
+    assert seen["query"] == "Where is the config"
+    assert result["query_sanitized"] is True
+    assert result["sanitizer"]["truncated"] is True
+    assert result["count"] == 1
+
+
+def test_tool_search_leaves_a_clean_query_alone(provider, integration_module, monkeypatch):
+    monkeypatch.setattr(integration_module, "search_memories", lambda q, **kw: {"results": []})
+    provider._palace_path = "/fake/palace"
+    result = provider._tool_search("where is the config?")
+    assert "sanitizer" not in result
+
+
+def test_l1_story_reports_an_unreadable_collection(integration_module, monkeypatch):
+    """A collection that cannot be read is not "No memories yet"."""
+    import sqlite3
+
+    monkeypatch.setattr("mempalace.layers._READ_RETRY_DELAY", 0)
+
+    class _Locked:
+        def get_recent(self, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        def get(self, **kwargs):
+            raise AssertionError("the same palace error must not be re-run as a scan")
+
+    story = integration_module._l1_story_from_collection(_Locked())
+    assert "No memories" not in story
+    assert "could not be read right now (OperationalError)" in story
+
+
+def test_l1_story_reads_inline_while_the_caller_holds_the_collection_lock(integration_module):
+    """The read runs on the caller's thread and is never cut off, so the
+    provider's _collection_lock is held for all of it (no abandoned reader
+    racing a writer on the shared Chroma client)."""
+    import time
+
+    lock = threading.Lock()
+    seen = []
+
+    class _Slow:
+        def get(self, **kwargs):
+            time.sleep(0.5)  # longer than the wake-up budget
+            seen.append((threading.current_thread() is caller, lock.locked()))
+            return {"documents": ["A slow but complete read."], "metadatas": [{"room": "r"}]}
+
+    caller = threading.current_thread()
+    with lock:
+        story = integration_module._l1_story_from_collection(_Slow())
+
+    assert seen and seen[0] == (True, True)
+    assert "A slow but complete read." in story
+
+
+def test_l1_story_reads_the_newest_drawers(integration_module):
+    class _Col:
+        def get(self, **kwargs):
+            if kwargs.get("offset"):
+                return {"documents": [], "metadatas": []}
+            return {
+                "documents": ["A memory filed through the provider's own client."],
+                "metadatas": [{"room": "r", "filed_at": "2026-10-01"}],
+            }
+
+    story = integration_module._l1_story_from_collection(_Col(), wing="w")
+    assert "A memory filed through the provider's own client." in story

@@ -8,18 +8,17 @@ from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
-from hypothesis import given
-from hypothesis import strategies as st
+from hypothesis import given, strategies as st
 
 import mempalace.hooks_cli as hooks_cli_mod
 from mempalace.config import sanitize_name
 from mempalace.hooks_cli import (
     SAVE_INTERVAL,
+    _claim_mine_slot,
     _count_human_messages,
     _diary_agent_for_harness,
     _extract_recent_messages,
     _get_mine_targets,
-    _hooks_daemon_enabled,
     _is_harness_boilerplate,
     _log,
     _maybe_auto_ingest,
@@ -27,18 +26,17 @@ from mempalace.hooks_cli import (
     _mine_already_running,
     _mine_sync,
     _parse_harness_input,
+    _pid_file_for_cmd,
     _safe_wing_slug,
     _sanitize_session_id,
     _save_diary_direct,
     _validate_transcript_path,
     _wing_from_transcript_path,
-    hook_stop,
-    hook_session_start,
-    hook_session_end,
     hook_precompact,
+    hook_session_end,
+    hook_session_start,
+    hook_stop,
     run_hook,
-    _claim_mine_slot,
-    _pid_file_for_cmd,
 )
 
 
@@ -919,13 +917,6 @@ def test_save_diary_daemon_lock_deferral_does_not_stall_the_hook(tmp_path):
     assert "deferred" in logged
     assert "PID 999" in logged
     assert "Daemon diary checkpoint failed" not in logged, "a parked job is not a failure"
-
-
-def test_hooks_daemon_enabled_requires_explicit_true():
-    with patch("mempalace.hooks_cli.MempalaceConfig") as mock_cfg_cls:
-        assert _hooks_daemon_enabled() is False
-        mock_cfg_cls.return_value.hook_use_daemon = True
-        assert _hooks_daemon_enabled() is True
 
 
 # --- hook_session_start ---
