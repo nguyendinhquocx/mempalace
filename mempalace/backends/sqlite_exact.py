@@ -17,7 +17,6 @@ import os
 import re
 import sqlite3
 import threading
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -31,6 +30,7 @@ from ..stored_text import (
     index_text,
     prepare_stored_write,
 )
+from ..timeutil import recency_floor, recency_key, utc_now_iso as _utcnow
 from ._filters import matches_where, matches_where_document, validate_where
 from ._magic import has_sqlite_magic, read_header_fields
 from .base import (
@@ -60,10 +60,6 @@ _DB_FILENAME = "sqlite_exact.sqlite3"
 # stamp the checkpoint with the same mtime as the previous one.
 _WRITE_GENERATION_KEY = "write_generation"
 _WRITE_GENERATION_SQL = "SELECT value FROM meta WHERE key = ?"
-
-
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _bump_write_generation(executor) -> None:
@@ -126,6 +122,11 @@ _LOCUS_INDEX = "idx_documents_coll_wing_room_hall"
 # Locus columns stay wing/room/hall (low-cardinality facets); source_file
 # is high-cardinality and stays in metadata_json.
 _SOURCE_FILE_INDEX = "idx_documents_coll_source_file"
+# Expression indexes for ``get_recent``: newest ``filed_at`` overall, and
+# within a wing (wake-up scopes to the wing's alias set). Both carry ``id``
+# so the ordering reads never touch the rows.
+_FILED_AT_INDEX = "idx_documents_coll_filed_at"
+_WING_FILED_AT_INDEX = "idx_documents_coll_wing_filed_at"
 
 
 def _json_field_sql(key: str, *, locus_columns: bool = True) -> str:
@@ -169,10 +170,10 @@ def _where_uses_only_cached_keys(where: Optional[dict]) -> bool:
 def _equality_where_sql(
     where: Optional[dict], *, locus_columns: bool = True
 ) -> Optional[tuple[str, list]]:
-    """Push equality / ``$and``-of-equality filters into SQL, else ``None``.
+    """Push equality, ``$eq`` / ``$in`` and ``$and`` of them into SQL, else ``None``.
 
     ``None`` means the filter needs the Python ``matches_where`` path
-    (``$or``, comparisons, ``$contains``, non-identifier keys).
+    (``$or``, comparisons, ``$contains``, ``None`` operands, non-identifier keys).
     """
     if not where:
         return "1=1", []
@@ -192,11 +193,44 @@ def _equality_where_sql(
     clauses = []
     params = []
     for key, expected in where.items():
-        if key.startswith("$") or isinstance(expected, dict) or not _FACET_FIELD_RE.match(key):
+        if key.startswith("$") or not _FACET_FIELD_RE.match(key):
             return None
-        clauses.append(f"{_json_field_sql(key, locus_columns=locus_columns)} = ?")
-        params.append(encode_filter(expected))
+        expr = _json_field_sql(key, locus_columns=locus_columns)
+        if not isinstance(expected, dict):
+            clauses.append(f"{expr} = ?")
+            params.append(encode_filter(expected))
+            continue
+        # ``$eq`` / ``$in`` of scalars push down; ``None`` stays in Python,
+        # where it also matches a missing key.
+        if len(expected) != 1:
+            return None
+        ((op, operand),) = expected.items()
+        if op == "$eq" and _pushable_scalar(operand):
+            clauses.append(f"{expr} = ?")
+            params.append(encode_filter(expected)["$eq"])
+        elif (
+            op == "$in"
+            and isinstance(operand, (list, tuple))
+            and len(operand) <= _MAX_PUSHED_IN
+            and all(_pushable_scalar(value) for value in operand)
+        ):
+            if not operand:
+                clauses.append("0=1")
+                continue
+            clauses.append(f"{expr} IN ({','.join('?' for _ in operand)})")
+            params.extend(encode_filter(expected)["$in"])
+        else:
+            return None
     return (" AND ".join(clauses) if clauses else "1=1"), params
+
+
+_MAX_PUSHED_IN = 500
+
+
+def _pushable_scalar(value) -> bool:
+    return isinstance(value, (str, int, float)) and not (
+        isinstance(value, float) and value != value
+    )
 
 
 def _cosine_distances(
@@ -1247,6 +1281,70 @@ class SQLiteExactCollection(BaseCollection):
                 rows = rows[:limit]
         return self._get_result(rows, spec)
 
+    def get_recent(self, *, limit, where=None, order_field="filed_at", include=None):
+        """Newest ``limit`` records by the instant in ``order_field``, read in SQL.
+
+        Text order is instant order only within one timestamp form, so the
+        newest UTC-suffixed values and the newest of the rest are read
+        separately and merged; records without the field follow in storage
+        order. A filter SQL cannot evaluate keeps the base implementation.
+        """
+        if limit is None or limit <= 0:
+            return super().get_recent(
+                limit=limit, where=where, order_field=order_field, include=include
+            )
+        validate_where(where)
+        push = _equality_where_sql(where, locus_columns=self._handle.has_locus_columns)
+        if push is None or not _FACET_FIELD_RE.match(order_field):
+            return super().get_recent(
+                limit=limit, where=where, order_field=order_field, include=include
+            )
+        spec = _IncludeSpec.resolve(include, default_distances=False)
+        filter_sql, filter_params = push
+        # Spelled exactly like the recency indexes so the planner can use them.
+        ts = _json_field_sql(order_field, locus_columns=False)
+        dated = f"typeof({ts}) = 'text' AND {ts} > ''"
+        utc = f"(substr({ts}, -6) = '+00:00' OR substr({ts}, -1) IN ('Z', 'z'))"
+        with self._cursor() as cur:
+            collection_id = self._collection_id(cur)
+            # For a wing ``IN`` list the planner prefers walking the whole
+            # filed_at index over reading each wing's newest from the wing one.
+            scopes = [where or {}, *(where or {}).get("$and", [])]
+            hint = ""
+            if (
+                order_field == "filed_at"
+                and any("wing" in scope for scope in scopes)
+                and self._handle.has_locus_columns
+                and cur.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    (_WING_FILED_AT_INDEX,),
+                ).fetchone()
+            ):
+                hint = f" INDEXED BY {_WING_FILED_AT_INDEX}"
+
+            def read(condition, condition_params, order):
+                return cur.execute(
+                    f"SELECT id, {ts} FROM documents{hint}"
+                    f" WHERE collection_id = ? AND ({filter_sql}) AND {condition}"
+                    f" ORDER BY {order} LIMIT ?",
+                    (collection_id, *filter_params, *condition_params, limit),
+                ).fetchall()
+
+            # The newest ``limit`` values in text order give a text floor that
+            # bounds how far back either form reads.
+            newest = read(dated, [], f"{ts} DESC")
+            floor = recency_floor(r[1] for r in newest) if len(newest) == limit else ""
+            rows = read(f"{dated} AND {ts} >= ? AND {utc}", [floor], f"{ts} DESC, id") + read(
+                f"{dated} AND {ts} >= ? AND NOT {utc}", [floor], f"{ts} DESC, id"
+            )
+            rows.sort(key=lambda r: r[0])
+            rows.sort(key=lambda r: recency_key(r[1]), reverse=True)
+            ids = [r[0] for r in rows[:limit]]
+            if len(ids) < limit:
+                ids += [r[0] for r in read(f"NOT ({dated})", [], "rowid")][: limit - len(ids)]
+            by_id = self._rows_by_ids(cur, collection_id, ids, spec)
+        return self._get_result([by_id[i] for i in ids if i in by_id], spec)
+
     @staticmethod
     def _get_result(rows: list[dict], spec: _IncludeSpec) -> GetResult:
         return GetResult(
@@ -1819,7 +1917,9 @@ class SQLiteExactBackend(BaseBackend):
         1.6 GB palace does not copy embedding blobs. CREATE INDEX walks
         metadata_json once and stores the loci. Existing palaces migrate
         here on the next writable open. The source_file expression index is
-        the closet-enrichment lookup (``get(where={source_file})``).
+        the closet-enrichment lookup (``get(where={source_file})``); the
+        filed_at ones serve ``get_recent``. A read-only open never creates
+        them and reads without.
         """
         cols = _document_column_names(conn)
         for field in _LOCUS_FIELDS:
@@ -1846,6 +1946,18 @@ class SQLiteExactBackend(BaseBackend):
                     collection_id,
                     (json_extract(metadata_json, '$.source_file'))
                 )
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {_FILED_AT_INDEX}
+                ON documents(collection_id, (json_extract(metadata_json, '$.filed_at')), id)
+            """
+        )
+        conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS {_WING_FILED_AT_INDEX}
+                ON documents(collection_id, wing, (json_extract(metadata_json, '$.filed_at')), id)
             """
         )
 

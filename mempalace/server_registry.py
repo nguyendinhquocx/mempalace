@@ -24,15 +24,17 @@ that every reader ignores and the next hub overwrites.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
-import time
 from pathlib import Path
 
+from mempalace import paths
+from mempalace._env import env_str
 from mempalace._proc import pid_alive as _pid_alive
 from mempalace.fsio import atomic_write_text, read_published_bytes
+
+from .timeutil import utc_now_z
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +44,8 @@ _WILDCARD_HOSTS = {"0.0.0.0", "::", "[::]"}
 _TOKEN_ENV = "MEMPALACE_MCP_HTTP_TOKEN"
 
 
-def _canonical(palace_path: str) -> str:
-    return os.path.abspath(os.path.realpath(os.path.expanduser(palace_path)))
-
-
 def _utc_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return utc_now_z()
 
 
 def server_state_dir(palace_path: str) -> Path:
@@ -56,8 +54,7 @@ def server_state_dir(palace_path: str) -> Path:
     Keyed by the canonical palace path so one hub per palace reuses a stable
     directory across restarts.
     """
-    key = hashlib.sha256(os.path.normcase(_canonical(palace_path)).encode("utf-8")).hexdigest()[:24]
-    return Path.home() / ".mempalace" / "server" / key
+    return paths.state_path("server", paths.palace_key(palace_path))
 
 
 def server_token_path(palace_path: str) -> Path:
@@ -135,7 +132,7 @@ def write_serverinfo(
         "read_only": bool(read_only),
         "capabilities": sorted(set(capabilities or [])),
         "search_config_fingerprint": search_config_fingerprint,
-        "palace_path": _canonical(palace_path),
+        "palace_path": paths.canonical_palace_path(palace_path),
     }
     atomic_write_text(path, json.dumps(payload) + "\n")
     return path
@@ -265,7 +262,7 @@ def load_server_tokens(palace_path: str) -> tuple[str, ...]:
     while an older generated palace credential remains on disk.
     """
     palace_token = _read_server_token_file(palace_path)
-    process_token = os.environ.get(_TOKEN_ENV, "").strip()
+    process_token = env_str(_TOKEN_ENV, "")
     candidates = []
     for token in (palace_token, process_token):
         if token and token not in candidates:

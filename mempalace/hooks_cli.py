@@ -26,9 +26,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from mempalace import paths
+from mempalace._env import env_float, env_str, parse_bool
 from mempalace._proc import pid_alive as _pid_alive
-from mempalace.config import MempalaceConfig
+from mempalace.config import MempalaceConfig, normalize_wing_name
 from mempalace.fsio import decode_source
+from mempalace.timeutil import utc_now_iso
 from mempalace.write_routing import (
     ResolvedWriteRoutingPolicy,
     WriteRoutingDecision,
@@ -38,8 +41,8 @@ from mempalace.write_routing import (
 )
 
 SAVE_INTERVAL = 15
-STATE_DIR = Path.home() / ".mempalace" / "hook_state"
-PALACE_ROOT = Path.home() / ".mempalace"
+STATE_DIR = paths.state_path("hook_state")
+PALACE_ROOT = paths.state_home()
 
 
 def _detached_popen_kwargs() -> dict:
@@ -65,9 +68,7 @@ def _detached_popen_kwargs() -> dict:
 
 def _config_root() -> Path:
     """The directory this install keeps its config in (XDG-aware)."""
-    from .config import _default_config_dir
-
-    return _default_config_dir()
+    return paths.config_dir()
 
 
 def _palace_root_exists() -> bool:
@@ -352,14 +353,9 @@ def _mine_slot_timeout_secs() -> float:
     Reads ``MEMPALACE_MINE_TIMEOUT_HOURS`` from the environment (float).
     Returns 0 if the env var is set to 0 or is not parseable.
     """
-    raw = os.environ.get(_MINE_TIMEOUT_HOURS_ENV, "")
-    if raw:
-        try:
-            hours = float(raw)
-            return max(0.0, hours) * 3600
-        except ValueError:
-            return 0.0
-    return _MINE_TIMEOUT_HOURS_DEFAULT * 3600
+    if env_str(_MINE_TIMEOUT_HOURS_ENV) is None:
+        return _MINE_TIMEOUT_HOURS_DEFAULT * 3600
+    return max(0.0, env_float(_MINE_TIMEOUT_HOURS_ENV, 0.0)) * 3600
 
 
 def _pid_file_for_cmd(cmd: list[str]) -> Path:
@@ -1184,7 +1180,7 @@ def _save_diary_direct(
                 try:
                     ack_file = STATE_DIR / "last_checkpoint"
                     ack_file.write_text(
-                        json.dumps({"msgs": len(messages), "ts": now.isoformat()}),
+                        json.dumps({"msgs": len(messages), "ts": utc_now_iso()}),
                         encoding="utf-8",
                     )
                 except OSError:
@@ -1212,7 +1208,7 @@ def _save_diary_direct(
                 "themes": themes,
                 "session_id": session_id,
                 "exchange_count": exchange_count,
-                "ack_ts": now.isoformat(),
+                "ack_ts": utc_now_iso(),
                 "ingest_transcript": transcript_path,
             }
         )
@@ -1250,7 +1246,7 @@ def _ingest_transcript(transcript_path: str):
         _log_hook_write_blocked(routing, "transcript ingest")
         return
 
-    wing = _ingest_wing(str(path))
+    wing = _project_wing(str(path))
     try:
         if routing.use_daemon:
             try:
@@ -1330,24 +1326,9 @@ _ENCODED_PARENT_PREFIXES = (
 )
 
 
-def _safe_wing_slug(name: str) -> str:
-    """Normalize a project directory name into a wing slug ``sanitize_name`` accepts.
-
-    Builds on the historical space/hyphen handling: map characters outside
-    ``sanitize_name``'s set to ``_`` while keeping ``.`` and ``'`` so existing wings
-    for names like ``my.app`` are preserved (renaming a wing would orphan diary
-    entries already filed under it), collapse ``..`` which the validator rejects as
-    path traversal, trim edge separators it won't accept, and cap the length so
-    ``wing_<slug>`` stays within ``sanitize_name``'s 128-character limit. Without
-    this a folder containing e.g. a leading ``+`` produced ``wing_+project``, which
-    ``sanitize_name`` rejects — silently breaking diary auto-save. Falls back to
-    ``sessions`` when a name reduces to nothing (e.g. ``+``).
-    """
-    slug = name.lower().replace(" ", "_").replace("-", "_")
-    slug = re.sub(r"[^\w.']+", "_", slug)
-    slug = re.sub(r"\.{2,}", ".", slug)
-    slug = slug[:120].strip("_.'")
-    return slug or "sessions"
+def _wing_slug(name: str) -> str:
+    """The project wing for a directory name; ``sessions`` when nothing is left."""
+    return normalize_wing_name(name) or "sessions"
 
 
 def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
@@ -1395,13 +1376,13 @@ def _cwd_from_jsonl(transcript_path: str) -> Optional[str]:
 
 
 def _wing_from_jsonl_cwd(transcript_path: str) -> Optional[str]:
-    """``wing_<project>`` from the transcript's cwd leaf, or ``None``."""
+    """The project wing from the transcript's cwd leaf, or ``None``."""
     cwd_norm = _cwd_from_jsonl(transcript_path)
     if not cwd_norm:
         return None
     project = cwd_norm.rsplit("/", 1)[-1]
     if project:
-        return f"wing_{_safe_wing_slug(project)}"
+        return _wing_slug(project)
     return None
 
 
@@ -1414,23 +1395,22 @@ def _workstation_wing() -> str:
     return "linux_workstation"
 
 
-def _ingest_wing(transcript_path: str) -> str:
-    """Wing for a hook-ingested transcript: the project the session ran in.
+def _project_wing(transcript_path: str) -> str:
+    """The one wing a session files into: its diary and its transcript both.
 
-    Same derivation the diary uses (cwd first, encoded project folder
-    second) without the ``wing_`` prefix, so a session in
-    ``~/dev/mempalace`` files into ``mempalace`` next to everything else
-    about that project instead of a flat ``sessions`` wing that
-    ``mempalace audit`` then flags. A session started in the home directory
-    belongs to no project and goes to the machine's workstation wing.
+    The project the session ran in (cwd first, encoded project folder
+    second), so a session in ``~/dev/mempalace`` files into ``mempalace``
+    next to everything else about that project instead of a flat
+    ``sessions`` wing that ``mempalace audit`` then flags. A session started
+    in the home directory belongs to no project and goes to the machine's
+    workstation wing.
     """
     cwd_norm = _cwd_from_jsonl(transcript_path)
     if cwd_norm:
         home = str(Path.home()).replace("\\", "/").rstrip("/")
         if cwd_norm.lower() == home.lower():
             return _workstation_wing()
-    wing = _wing_from_transcript_path(transcript_path)
-    return wing[len("wing_") :] if wing.startswith("wing_") else wing
+    return _wing_from_transcript_path(transcript_path)
 
 
 def _wing_from_transcript_path(transcript_path: str) -> str:
@@ -1456,7 +1436,7 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
     3. LEGACY — Match an explicit ``-Projects-<name>`` segment for
        transcripts not under the standard Claude Code projects dir.
 
-    4. DEFAULT — ``wing_sessions``.
+    4. DEFAULT — ``sessions``.
     """
     # 1. Primary — cwd from JSONL is the canonical source of truth
     cwd_wing = _wing_from_jsonl_cwd(transcript_path)
@@ -1488,15 +1468,15 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
             if encoded.startswith(prefix):
                 encoded = encoded[len(prefix) :]
                 break
-        return f"wing_{_safe_wing_slug(encoded)}"
+        return _wing_slug(encoded)
 
     # 3. Legacy — explicit -Projects-<name> segment
     match = re.search(r"-Projects-([^/]+?)(?:/|$)", normalized)
     if match:
-        return f"wing_{_safe_wing_slug(match.group(1))}"
+        return _wing_slug(match.group(1))
 
     # 4. Default
-    return "wing_sessions"
+    return "sessions"
 
 
 def hook_stop(data: dict, harness: str):
@@ -1518,7 +1498,7 @@ def hook_stop(data: dict, harness: str):
     # Silent mode saves directly without returning {"decision":"block"}, so there's
     # no loop to prevent — and Claude Code's plugin dispatch sets this flag on every
     # fire after the first, which would otherwise suppress all subsequent auto-saves.
-    if str(stop_hook_active).lower() in ("true", "1", "yes"):
+    if parse_bool(stop_hook_active):
         # Safe default: assume silent mode on any config-read failure so saves
         # proceed rather than being silently dropped. Silent mode is the default
         # (v3.3.0+), so if we can't read config, behave as if it's still on.
@@ -1566,7 +1546,7 @@ def hook_stop(data: dict, harness: str):
                 silent = True
                 toast = False
 
-            project_wing = _wing_from_transcript_path(transcript_path)
+            project_wing = _project_wing(transcript_path)
 
             if silent:
                 # Save directly via Python API — systemMessage renders in terminal
@@ -1754,7 +1734,7 @@ def hook_session_end(data: dict, harness: str):
                 result = _save_diary_direct(
                     valid_transcript,
                     session_id,
-                    wing=_wing_from_transcript_path(valid_transcript),
+                    wing=_project_wing(valid_transcript),
                     toast=toast,
                     agent_name=_diary_agent_for_harness(harness),
                 )

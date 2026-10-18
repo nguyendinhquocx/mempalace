@@ -43,9 +43,9 @@ import json
 import os
 import time
 import urllib.parse
-from datetime import datetime
 from typing import Optional
 
+from . import paths
 from .llm_client import (
     endpoint_is_local,
     external_use_accepted_by_env,
@@ -61,6 +61,8 @@ from .palace import (
     purge_file_closets,
     upsert_closet_lines,
 )
+from .search_util import palace_wing_aliases
+from .timeutil import utc_now_iso
 
 MAX_CONTENT_CHARS = 30000
 MAX_OUTPUT_TOKENS = 1500
@@ -283,6 +285,8 @@ def _regenerate_closets_owned(
     # SQLite's SQLITE_MAX_VARIABLE_NUMBER (32766) on large palaces and
     # crashes inside chromadb.
     by_source: dict = {}
+    # A wing reads every spelling its project was filed under.
+    wings = set(palace_wing_aliases(wing, drawers_col)) if wing else None
     batch_size = 5000
     offset = 0
     while offset < total:
@@ -294,7 +298,7 @@ def _regenerate_closets_owned(
             meta = meta or {}
             source = meta.get("source_file", "unknown")
             w = meta.get("wing", "")
-            if wing and w != wing:
+            if wings is not None and w not in wings:
                 continue
             if source not in by_source:
                 by_source[source] = {"drawer_ids": [], "content": [], "meta": meta}
@@ -360,7 +364,7 @@ def _regenerate_closets_owned(
                     "room": r,
                     "source_file": source,
                     "generated_by": f"llm:{cfg.model}",
-                    "filed_at": datetime.now().isoformat(),
+                    "filed_at": utc_now_iso(),
                     "entities": entities,
                     # Stamp so the miner's stale-drawer gate doesn't treat
                     # LLM closets as leftovers and rebuild over them next run.
@@ -392,7 +396,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--palace",
-        default=os.path.expanduser("~/.mempalace/palace"),
+        default=paths.default_palace_path(),
         help="Path to the palace",
     )
     parser.add_argument("--wing", default=None, help="Limit to one wing")

@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from . import paths
+from ._env import env_str, parse_number
 from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
 from .fsio import atomic_write_json, encoding_metadata, move_aside, read_source_text
 
@@ -62,8 +64,9 @@ from .project_config import (  # noqa: F401
     find_project_config,
 )
 from .source_identity import source_directory_identity
+from .timeutil import utc_now_iso
 
-logger = logging.getLogger("mempalace_mcp")
+logger = logging.getLogger(__name__)
 
 
 def _path_within_root(path: Path, root: Path) -> bool:
@@ -227,22 +230,14 @@ def _resolve_max_chunks_per_file(override: Optional[int] = None) -> int:
             )
             return MAX_CHUNKS_PER_FILE
         return int(override)
-    raw = os.environ.get("MEMPALACE_MAX_CHUNKS_PER_FILE")
+    raw = env_str("MEMPALACE_MAX_CHUNKS_PER_FILE")
     if raw is None:
         return MAX_CHUNKS_PER_FILE
-    try:
-        val = int(raw)
-    except ValueError:
+    val = parse_number(raw, int)
+    if val is None or val < 0:
         print(
-            f"  ! WARNING: MEMPALACE_MAX_CHUNKS_PER_FILE={raw!r} is not an integer; "
-            f"using default {MAX_CHUNKS_PER_FILE}",
-            file=sys.stderr,
-        )
-        return MAX_CHUNKS_PER_FILE
-    if val < 0:
-        print(
-            f"  ! WARNING: MEMPALACE_MAX_CHUNKS_PER_FILE={val} is negative; "
-            f"using default {MAX_CHUNKS_PER_FILE}",
+            f"  ! WARNING: MEMPALACE_MAX_CHUNKS_PER_FILE={raw!r} is not a non-negative "
+            f"integer; using default {MAX_CHUNKS_PER_FILE}",
             file=sys.stderr,
         )
         return MAX_CHUNKS_PER_FILE
@@ -753,7 +748,7 @@ def chunk_text(
 # =============================================================================
 
 
-_ENTITY_REGISTRY_PATH = os.path.join(os.path.expanduser("~"), ".mempalace", "known_entities.json")
+_ENTITY_REGISTRY_PATH = str(paths.state_path("known_entities.json"))
 _ENTITY_REGISTRY_CACHE: dict = {"mtime": None, "names": frozenset(), "raw": {}}
 _ENTITY_EXTRACT_WINDOW = 5000  # chars of content scanned for capitalized words
 _ENTITY_METADATA_LIMIT = 25  # max entities packed into the metadata field
@@ -1492,7 +1487,7 @@ def _build_drawer_metadata(
         "source_file": source_file,
         "chunk_index": chunk_index,
         "added_by": agent,
-        "filed_at": datetime.now().isoformat(),
+        "filed_at": utc_now_iso(),
         "normalize_version": NORMALIZE_VERSION,
         "id_recipe": ID_RECIPE,
     }
@@ -1747,7 +1742,7 @@ def process_file(
                 "room": room,
                 "source_file": source_file,
                 "drawer_count": int(drawers_added),
-                "filed_at": datetime.now().isoformat(),
+                "filed_at": utc_now_iso(),
                 "normalize_version": NORMALIZE_VERSION,
             }
             if entities:
@@ -2331,7 +2326,8 @@ def status(palace_path: str):
     un-bootstrapped collection, or an unexpected schema); the fallback also
     emits the state-specific guidance for absent/empty palaces.
     """
-    from .backends.chroma import _sqlite_wing_room_counts, hnsw_capacity_status
+    from .backends.chroma import hnsw_capacity_status
+    from .backends.chroma_sqlite import _sqlite_wing_room_counts
 
     counts = _sqlite_wing_room_counts(palace_path, "mempalace_drawers")
     if counts is not None:
