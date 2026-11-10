@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main, develop]
 
+# A push to a PR branch cancels the run its previous push started: the
+# earlier commit is no longer what would be merged, and the full matrix is
+# about 27 runner-minutes. Pushes to develop and main keep every run, so
+# each merge has its own result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test-linux:
     runs-on: ubuntu-latest
